@@ -38,17 +38,36 @@ let prizes = [];
 const PRIZE_CATEGORY = 0x0004;
 const WALL_CATEGORY  = 0x0001;
 
-// ─── Claw visual constants ────────────────────────────────────────────────────
-const HOUSING_W       = 80;   // px — width of housing box
-const HOUSING_H       = 28;   // px — height of housing box
-const ARM_LENGTH      = 100;  // px — arm length from pivot to tip
-const MAX_SPREAD      = 65;   // px — max lateral spread of arm tips from center
-const SENSOR_Y_OFFSET = 42;   // px — sensor offset below housing bottom (upper part of opening)
-const SENSOR_RADIUS   = 50;   // px — proximity detection radius
-const GRAB_HALF_W     = MAX_SPREAD * 0.85; // px — horizontal grab tolerance
-const INTERIOR_HALF_W = 18;   // px — half-width of claw interior (closed)
-const INTERIOR_BOT    = 48;   // px — bottom of fake interior (relative to hold point)
-const OPEN_ANIM_MS    = 420;  // ms — open/close animation duration
+// ─── Claw base constants (unscaled, at prizeScale = 0.45) ────────────────────
+const HOUSING_W_BASE       = 80;
+const HOUSING_H_BASE       = 28;
+const ARM_LENGTH_BASE      = 100;
+const MAX_SPREAD_BASE      = 65;
+const SENSOR_Y_OFFSET_BASE = 42;   // sensor sits in upper portion of opening
+const INTERIOR_HALF_W_BASE = 18;
+const INTERIOR_BOT_BASE    = 48;
+const OPEN_ANIM_MS         = 420;
+
+/**
+ * Returns all claw dimensions scaled proportionally to the current prize size.
+ * At default prizeScale (0.45) every value equals its BASE counterpart.
+ * @returns {{ cs: number, housW: number, housH: number, armLen: number, maxSpread: number, sensorYOff: number, grabHalfW: number, intHalfW: number, intBot: number }}
+ */
+const getDims = () => {
+	const cs        = Math.max(0.8, prizeScale.value / 0.45);
+	const maxSpread = MAX_SPREAD_BASE * cs;
+	return {
+		cs,
+		housW:      HOUSING_W_BASE       * cs,
+		housH:      HOUSING_H_BASE       * cs,
+		armLen:     ARM_LENGTH_BASE      * cs,
+		maxSpread,
+		sensorYOff: SENSOR_Y_OFFSET_BASE * cs,
+		grabHalfW:  maxSpread * 0.85,
+		intHalfW:   INTERIOR_HALF_W_BASE * cs,
+		intBot:     INTERIOR_BOT_BASE    * cs,
+	};
+};
 
 // ─── Claw runtime state ───────────────────────────────────────────────────────
 let clawX          = 0;
@@ -159,6 +178,7 @@ const tickFakePhysics = () => {
 	const GRAVITY  = 0.30;
 	const DAMPING  = 0.88;
 	const SPRING_K = 0.038;
+	const { cs, housH, armLen, intHalfW, intBot } = getDims();
 
 	fakeVelY += GRAVITY;
 	fakeVelX -= fakeRelX * SPRING_K;
@@ -168,15 +188,15 @@ const tickFakePhysics = () => {
 	fakeRelX += fakeVelX;
 	fakeRelY += fakeVelY;
 
-	// Bounce off claw interior walls — wider when open so it can feel loose
-	const halfW = INTERIOR_HALF_W + clawOpenAmount * 28;
-	if (fakeRelX >  halfW) { fakeRelX =  halfW; fakeVelX *= -0.45; }
-	if (fakeRelX < -halfW) { fakeRelX = -halfW; fakeVelX *= -0.45; }
-	if (fakeRelY < 0)           { fakeRelY = 0;           fakeVelY *= -0.30; }
-	if (fakeRelY > INTERIOR_BOT) { fakeRelY = INTERIOR_BOT; fakeVelY *= -0.50; }
+	// Bounce off scaled claw interior walls — wider when open so it feels loose
+	const halfW = intHalfW + clawOpenAmount * 28 * cs;
+	if (fakeRelX >  halfW)  { fakeRelX =  halfW;  fakeVelX *= -0.45; }
+	if (fakeRelX < -halfW)  { fakeRelX = -halfW;  fakeVelX *= -0.45; }
+	if (fakeRelY < 0)       { fakeRelY = 0;        fakeVelY *= -0.30; }
+	if (fakeRelY > intBot)  { fakeRelY = intBot;   fakeVelY *= -0.50; }
 
 	// Clamp prize to computed world position
-	const holdY = clawY + HOUSING_H / 2 + ARM_LENGTH * 0.62;
+	const holdY = clawY + housH / 2 + armLen * 0.62;
 	Body.setPosition(grabbedPrize, { x: clawX + fakeRelX, y: holdY + fakeRelY });
 	Body.setVelocity(grabbedPrize, { x: 0, y: 0 });
 	Body.setAngularVelocity(grabbedPrize, 0);
@@ -209,9 +229,11 @@ const checkWin = () => {
  * Matter.js canvas each render frame. Called via Events.on(render, 'afterRender').
  */
 const drawClaw = () => {
-	const ctx = render.context;
-	const cx  = clawX;
-	const cy  = clawY;
+	const ctx  = render.context;
+	const cx   = clawX;
+	const cy   = clawY;
+	const dims = getDims();
+	const { housW, housH } = dims;
 
 	ctx.save();
 
@@ -224,13 +246,13 @@ const drawClaw = () => {
 	ctx.lineWidth   = 5;
 	ctx.beginPath();
 	ctx.moveTo(cx, 0);
-	ctx.lineTo(cx, cy - HOUSING_H / 2);
+	ctx.lineTo(cx, cy - housH / 2);
 	ctx.stroke();
 
 	// ── Housing box ──
-	const hx      = cx - HOUSING_W / 2;
-	const hy      = cy - HOUSING_H / 2;
-	const boxGrad = ctx.createLinearGradient(hx, hy, hx, hy + HOUSING_H);
+	const hx      = cx - housW / 2;
+	const hy      = cy - housH / 2;
+	const boxGrad = ctx.createLinearGradient(hx, hy, hx, hy + housH);
 	boxGrad.addColorStop(0,    '#a0a0a0');
 	boxGrad.addColorStop(0.35, '#e8e8e8');
 	boxGrad.addColorStop(1,    '#505050');
@@ -242,12 +264,12 @@ const drawClaw = () => {
 	const R = 5;
 	ctx.beginPath();
 	ctx.moveTo(hx + R, hy);
-	ctx.lineTo(hx + HOUSING_W - R, hy);
-	ctx.quadraticCurveTo(hx + HOUSING_W, hy, hx + HOUSING_W, hy + R);
-	ctx.lineTo(hx + HOUSING_W, hy + HOUSING_H - R);
-	ctx.quadraticCurveTo(hx + HOUSING_W, hy + HOUSING_H, hx + HOUSING_W - R, hy + HOUSING_H);
-	ctx.lineTo(hx + R, hy + HOUSING_H);
-	ctx.quadraticCurveTo(hx, hy + HOUSING_H, hx, hy + HOUSING_H - R);
+	ctx.lineTo(hx + housW - R, hy);
+	ctx.quadraticCurveTo(hx + housW, hy, hx + housW, hy + R);
+	ctx.lineTo(hx + housW, hy + housH - R);
+	ctx.quadraticCurveTo(hx + housW, hy + housH, hx + housW - R, hy + housH);
+	ctx.lineTo(hx + R, hy + housH);
+	ctx.quadraticCurveTo(hx, hy + housH, hx, hy + housH - R);
 	ctx.lineTo(hx, hy + R);
 	ctx.quadraticCurveTo(hx, hy, hx + R, hy);
 	ctx.closePath();
@@ -258,29 +280,30 @@ const drawClaw = () => {
 	ctx.strokeStyle = 'rgba(0,0,0,0.25)';
 	ctx.lineWidth   = 1;
 	for (let i = 1; i < 4; i++) {
-		const lx = hx + (HOUSING_W / 4) * i;
+		const lx = hx + (housW / 4) * i;
 		ctx.beginPath();
 		ctx.moveTo(lx, hy + 4);
-		ctx.lineTo(lx, hy + HOUSING_H - 4);
+		ctx.lineTo(lx, hy + housH - 4);
 		ctx.stroke();
 	}
 
 	// Motor nub
-	const motorGrad = ctx.createRadialGradient(cx - 2, cy - 2, 1, cx, cy, 9);
+	const motorR    = 9 * dims.cs;
+	const motorGrad = ctx.createRadialGradient(cx - 2, cy - 2, 1, cx, cy, motorR);
 	motorGrad.addColorStop(0, '#888');
 	motorGrad.addColorStop(1, '#222');
 	ctx.fillStyle = motorGrad;
 	ctx.beginPath();
-	ctx.arc(cx, cy, 9, 0, Math.PI * 2);
+	ctx.arc(cx, cy, motorR, 0, Math.PI * 2);
 	ctx.fill();
 	ctx.fillStyle = '#aaa';
 	ctx.beginPath();
-	ctx.arc(cx, cy, 4, 0, Math.PI * 2);
+	ctx.arc(cx, cy, motorR * 0.45, 0, Math.PI * 2);
 	ctx.fill();
 
 	// ── Arms ──
-	drawClawArm(ctx, cx, cy, -1, clawOpenAmount);
-	drawClawArm(ctx, cx, cy,  1, clawOpenAmount);
+	drawClawArm(ctx, cx, cy, -1, clawOpenAmount, dims);
+	drawClawArm(ctx, cx, cy,  1, clawOpenAmount, dims);
 
 	ctx.restore();
 };
@@ -289,35 +312,37 @@ const drawClaw = () => {
  * Draws one curved claw arm with a metallic gradient and hooked tip.
  *
  * @param {CanvasRenderingContext2D} ctx
- * @param {number} cx   - claw center x (world)
- * @param {number} cy   - claw center y, housing center (world)
- * @param {number} side - -1 = left arm, 1 = right arm
- * @param {number} open - 0 = fully closed, 1 = fully open
+ * @param {number} cx    - claw center x (world)
+ * @param {number} cy    - claw center y, housing center (world)
+ * @param {number} side  - -1 = left arm, 1 = right arm
+ * @param {number} open  - 0 = fully closed, 1 = fully open
+ * @param {{ housW: number, housH: number, armLen: number, maxSpread: number }} dims
  */
-const drawClawArm = (ctx, cx, cy, side, open) => {
+const drawClawArm = (ctx, cx, cy, side, open, dims) => {
+	const { housW, housH, armLen, maxSpread } = dims;
 	const s      = side;
-	const spread = open * MAX_SPREAD;
+	const spread = open * maxSpread;
 
 	// Pivot sits at bottom corner of housing
-	const pivotX = cx + s * (HOUSING_W * 0.28);
-	const pivotY = cy + HOUSING_H / 2;
+	const pivotX = cx + s * (housW * 0.28);
+	const pivotY = cy + housH / 2;
 
 	// Tip sits below and laterally offset based on spread
 	const tipX = cx + s * (8 + spread);
-	const tipY = pivotY + ARM_LENGTH;
+	const tipY = pivotY + armLen;
 
 	// ── Outer edge bezier (wide side of arm) ──
 	const oc1x = pivotX + s * (10 + spread * 0.45);
-	const oc1y = pivotY + ARM_LENGTH * 0.38;
+	const oc1y = pivotY + armLen * 0.38;
 	const oc2x = tipX   + s * 14;
-	const oc2y = tipY   - ARM_LENGTH * 0.18;
+	const oc2y = tipY   - armLen * 0.18;
 
 	// ── Inner edge bezier (narrow side — gives arm its body) ──
-	const innerPivotX = cx + s * (HOUSING_W * 0.13);
+	const innerPivotX = cx + s * (housW * 0.13);
 	const ic1x = innerPivotX + s * (spread * 0.25);
-	const ic1y = pivotY      + ARM_LENGTH * 0.30;
+	const ic1y = pivotY      + armLen * 0.30;
 	const ic2x = cx + s * (spread * 0.70 + 2);
-	const ic2y = tipY - ARM_LENGTH * 0.12;
+	const ic2y = tipY - armLen * 0.12;
 
 	// Metallic diagonal gradient
 	const grad = ctx.createLinearGradient(pivotX, pivotY, tipX + s * 10, tipY);
@@ -355,8 +380,8 @@ const drawClawArm = (ctx, cx, cy, side, open) => {
 	ctx.beginPath();
 	ctx.moveTo(pivotX + s * 6, pivotY + 5);
 	ctx.bezierCurveTo(
-		pivotX + s * (5 + spread * 0.35), pivotY + ARM_LENGTH * 0.32,
-		tipX   + s * 9,                   tipY   - ARM_LENGTH * 0.22,
+		pivotX + s * (5 + spread * 0.35), pivotY + armLen * 0.32,
+		tipX   + s * 9,                   tipY   - armLen * 0.22,
 		tipX   + s * 5,                   tipY   - 6,
 	);
 	ctx.stroke();
@@ -366,22 +391,44 @@ const drawClawArm = (ctx, cx, cy, side, open) => {
 // ─── Sensor & grab ────────────────────────────────────────────────────────────
 
 /**
- * Returns the closest prize that is within sensor range of the claw's
- * detection zone — a point positioned high inside the opening so the
- * claw doesn't trigger too early on objects below.
+ * Detects prizes that are inside the claw opening using a hybrid test:
  *
- * @returns {Matter.Body|null}
+ *  • Vertical   — uses the prize CENTER, which must be within the opening
+ *                 band (between sensorYOff and armLen below the pivot).
+ *                 This prevents the sensor from firing while the claw is
+ *                 still high above a prize; the claw must descend until it
+ *                 is actually around the prize before triggering.
+ *
+ *  • Horizontal — uses the prize BOUNDS so that large or slightly off-center
+ *                 prizes are still detected even if their center is displaced.
+ *                 A prize whose edge is within arm-span counts as "reachable";
+ *                 whether the grab succeeds is determined separately by
+ *                 clawCanGrab(), which applies a tighter centering test.
+ *
+ * @returns {Matter.Body|null} The closest qualifying prize, or null.
  */
 const checkSensor = () => {
-	const sensorX = clawX;
-	const sensorY = clawY + HOUSING_H / 2 + SENSOR_Y_OFFSET;
+	const { housH, armLen, maxSpread, sensorYOff } = getDims();
+	const pivotY     = clawY + housH / 2;
+	const openingTop = pivotY + sensorYOff;   // prize center must have passed this
+	const openingBot = pivotY + armLen + 10;  // prize center must be above arm tips
+
 	let closest     = null;
-	let closestDist = SENSOR_RADIUS;
+	let closestDist = Infinity;
 
 	for (const p of prizes) {
 		if (p === grabbedPrize) continue;
-		const dx   = p.position.x - sensorX;
-		const dy   = p.position.y - sensorY;
+
+		// Vertical: prize CENTER must be inside the opening band
+		const cy = p.position.y;
+		if (cy < openingTop || cy > openingBot) continue;
+
+		// Horizontal: prize BOUNDS must overlap the arm span
+		const b = p.bounds;
+		if (b.max.x < clawX - maxSpread * 1.1 || b.min.x > clawX + maxSpread * 1.1) continue;
+
+		const dx   = p.position.x - clawX;
+		const dy   = cy - (openingTop + openingBot) / 2;
 		const dist = Math.sqrt(dx * dx + dy * dy);
 		if (dist < closestDist) {
 			closestDist = dist;
@@ -393,19 +440,20 @@ const checkSensor = () => {
 };
 
 /**
- * Returns true when the claw arms are realistically positioned on the
- * left and right sides of the prize (i.e. prize is between the tips
- * horizontally and within vertical reach).
+ * Returns true when the closed claw arms are realistically on the left and
+ * right sides of the prize (prize is between the tips horizontally, and
+ * within vertical reach of the arm length).
  *
  * @param {Matter.Body} prize
  * @returns {boolean}
  */
 const clawCanGrab = (prize) => {
+	const { housH, armLen, grabHalfW } = getDims();
 	const px      = prize.position.x;
 	const py      = prize.position.y;
-	const horizOk = Math.abs(px - clawX) < GRAB_HALF_W;
-	const vertTop = clawY + HOUSING_H / 2;
-	const vertBot = clawY + HOUSING_H / 2 + ARM_LENGTH + 20;
+	const horizOk = Math.abs(px - clawX) < grabHalfW;
+	const vertTop = clawY + housH / 2;
+	const vertBot = clawY + housH / 2 + armLen + 20;
 	return horizOk && py > vertTop && py < vertBot;
 };
 
@@ -416,8 +464,9 @@ const clawCanGrab = (prize) => {
  * @param {Matter.Body} prize
  */
 const grabPrize = (prize) => {
+	const { housH, armLen } = getDims();
 	grabbedPrize = prize;
-	const holdY  = clawY + HOUSING_H / 2 + ARM_LENGTH * 0.62;
+	const holdY  = clawY + housH / 2 + armLen * 0.62;
 	fakeRelX = prize.position.x - clawX;
 	fakeRelY = prize.position.y - holdY;
 	fakeVelX = 0;
@@ -502,7 +551,9 @@ const dropClaw = async () => {
 	const W      = window.innerWidth;
 	const H      = window.innerHeight;
 	const topY   = 100;
-	const floorY = H - 200;
+	// Allow the claw to descend close to the actual floor so bottom-layer prizes
+	// are reachable; the sensor will stop it early if it detects something first.
+	const floorY = H - 110;
 	const destX  = (targetX.value / 100) * (W - 500) + 400;
 
 	// 1. Open claw
@@ -545,24 +596,12 @@ const dropClaw = async () => {
 	message.value = 'DELIVERING...';
 	await moveClaw(90, topY, 6);
 
-	// 8. Open and release
+	// 8. Open and release — always drop into real physics so the prize falls
+	//    visibly. checkWin() will award it once it hits the chute floor.
 	message.value = 'RELEASE!';
 	await animateClawTo(1.0);
 
-	if (grabbedPrize) {
-		// If the prize is directly above the win zone, award it immediately
-		const absX = clawX + fakeRelX;
-		if (absX < 180) {
-			wonPrizesCount.value++;
-			Composite.remove(world, grabbedPrize);
-			const idx = prizes.indexOf(grabbedPrize);
-			if (idx !== -1) prizes.splice(idx, 1);
-			grabbedPrize = null;
-			message.value = 'WINNER!';
-		} else {
-			releasePrize();
-		}
-	}
+	if (grabbedPrize) releasePrize();
 
 	await new Promise(r => setTimeout(r, 900));
 	isDropping.value = false;
