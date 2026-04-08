@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue';
+import { ref, computed, onMounted, onUnmounted } from 'vue';
 import Matter from 'matter-js';
 import decomp from 'poly-decomp';
 
@@ -19,14 +19,43 @@ const {
 
 Common.setDecomp(decomp);
 
+// ─── Claw PNG metadata (native pixel dimensions and pivot/attach coords) ───────
+/** claw_top.png: 290×299, pivot at (145,16), grip attach points at y=228 */
+const CLAW_TOP_META = {
+	w: 290, h: 299,
+	pivX: 145, pivY: 16,
+	lgAttachX: 10,  lgAttachY: 228,  // left grip attach
+	rgAttachX: 279, rgAttachY: 228,  // right grip attach
+	bgAttachX: 145, bgAttachY: 228,  // back grip attach (center)
+};
+/** left_grip.png: 190×357, pivot at (165,25) — rotates CCW when closing */
+const LEFT_GRIP_META  = { w: 190, h: 357, pivX: 165, pivY: 25 };
+/** right_grip.png: 190×357, pivot at (25,25) — rotates CW when closing */
+const RIGHT_GRIP_META = { w: 190, h: 357, pivX: 25,  pivY: 25 };
+/** back_grip.png: 65×305, pivot at (31,14) — no rotation */
+const BACK_GRIP_META  = { w: 65,  h: 305, pivX: 31,  pivY: 14 };
+
+/** Native grip length in pixels (pivot-to-tip) */
+const GRIP_LENGTH_NATIVE = 332;   // RIGHT_GRIP_META.h - RIGHT_GRIP_META.pivY
+/** Native distance from claw_top pivot down to grip attachment point */
+const GRIP_ATTACH_NATIVE_Y = 212; // CLAW_TOP_META.lgAttachY - CLAW_TOP_META.pivY
+/** Maximum closing angle for left/right grips in degrees */
+const CLOSE_ANGLE_DEG = 20;
+
 // ─── Vue refs ─────────────────────────────────────────────────────────────────
-const canvas = ref(null);
-const targetX = ref(50);
+const canvas    = ref(null);
+const bgCanvas  = ref(null);
+const targetX   = ref(50);
 const isDropping = ref(false);
 const showSettings = ref(false);
 const prizeScale = ref(0.45);
 const message = ref('Ready!');
 const wonPrizesCount = ref(0);
+
+// Slip mechanic settings
+const slipChance  = ref(60);  // percent chance a grabbed prize will slip
+const slipMinTime = ref(3);   // seconds (minimum slip duration)
+const slipMaxTime = ref(6);   // seconds (maximum slip duration)
 
 const prizeFiles = ['bear.png', 'bunny.png', 'cat.png', 'doggo.png', 'pengy.png', 'sheep.png'];
 
@@ -39,33 +68,51 @@ const PRIZE_CATEGORY = 0x0004;
 const WALL_CATEGORY  = 0x0001;
 
 // ─── Claw base constants (unscaled, at prizeScale = 0.45) ────────────────────
-const HOUSING_W_BASE       = 80;
-const HOUSING_H_BASE       = 28;
 const ARM_LENGTH_BASE      = 100;
 const MAX_SPREAD_BASE      = 65;
-const SENSOR_Y_OFFSET_BASE = 42;   // sensor sits in upper portion of opening
+const SENSOR_Y_OFFSET_BASE = 42;
 const INTERIOR_HALF_W_BASE = 18;
 const INTERIOR_BOT_BASE    = 48;
 const OPEN_ANIM_MS         = 420;
 
+// ─── Dynamic chute width (scales with prize size) ─────────────────────────────
+/**
+ * Width of the win chute in pixels. Scales proportionally with prizeScale so
+ * larger prizes can still fall into it.
+ * @type {import('vue').ComputedRef<number>}
+ */
+const chuteWidth = computed(() => {
+	const cs = Math.max(0.8, prizeScale.value / 0.45);
+	return Math.round(180 * cs);
+});
+
 /**
  * Returns all claw dimensions scaled proportionally to the current prize size.
  * At default prizeScale (0.45) every value equals its BASE counterpart.
- * @returns {{ cs: number, housW: number, housH: number, armLen: number, maxSpread: number, sensorYOff: number, grabHalfW: number, intHalfW: number, intBot: number }}
+ *
+ * @returns {{
+ *   cs: number, armLen: number, maxSpread: number,
+ *   sensorYOff: number, grabHalfW: number,
+ *   intHalfW: number, intBot: number,
+ *   clawRenderScale: number, attachOffset: number
+ * }}
  */
 const getDims = () => {
-	const cs        = Math.max(0.8, prizeScale.value / 0.45);
-	const maxSpread = MAX_SPREAD_BASE * cs;
+	const cs             = Math.max(0.8, prizeScale.value / 0.45);
+	const armLen         = ARM_LENGTH_BASE * cs;
+	const clawRenderScale = armLen / GRIP_LENGTH_NATIVE;
+	const attachOffset   = GRIP_ATTACH_NATIVE_Y * clawRenderScale;
+	const maxSpread      = MAX_SPREAD_BASE * cs;
 	return {
 		cs,
-		housW:      HOUSING_W_BASE       * cs,
-		housH:      HOUSING_H_BASE       * cs,
-		armLen:     ARM_LENGTH_BASE      * cs,
+		armLen,
 		maxSpread,
 		sensorYOff: SENSOR_Y_OFFSET_BASE * cs,
 		grabHalfW:  maxSpread * 0.85,
 		intHalfW:   INTERIOR_HALF_W_BASE * cs,
 		intBot:     INTERIOR_BOT_BASE    * cs,
+		clawRenderScale,
+		attachOffset,
 	};
 };
 
@@ -82,10 +129,52 @@ let openAnimTo     = 0.0;
 
 // ─── Fake-physics state for grabbed prize ─────────────────────────────────────
 let grabbedPrize = null;
-let fakeRelX     = 0;  // prize x offset relative to claw hold-point
-let fakeRelY     = 0;  // prize y offset relative to claw hold-point
+let fakeRelX     = 0;
+let fakeRelY     = 0;
 let fakeVelX     = 0;
 let fakeVelY     = 0;
+
+// ─── Slip state ───────────────────────────────────────────────────────────────
+let isSlipping    = false;
+let slipStartTime = 0;
+let slipDuration  = 0;  // seconds
+
+// ─── Loaded sprite images ─────────────────────────────────────────────────────
+let clawTopImg   = null;
+let leftGripImg  = null;
+let rightGripImg = null;
+let backGripImg  = null;
+
+// ─── Chute physics wall ───────────────────────────────────────────────────────
+let chuteWall = null;
+
+// ─── Image loading ────────────────────────────────────────────────────────────
+
+/**
+ * Preloads all four claw sprite images before the game starts.
+ * @returns {Promise<void>}
+ */
+const loadImages = () => {
+	return new Promise(resolve => {
+		let loaded = 0;
+		const onLoad = () => { if (++loaded === 4) resolve(); };
+
+		clawTopImg   = new Image();
+		leftGripImg  = new Image();
+		rightGripImg = new Image();
+		backGripImg  = new Image();
+
+		clawTopImg.onload   = onLoad;
+		leftGripImg.onload  = onLoad;
+		rightGripImg.onload = onLoad;
+		backGripImg.onload  = onLoad;
+
+		clawTopImg.src   = '/claw/claw_top.png';
+		leftGripImg.src  = '/claw/left_grip.png';
+		rightGripImg.src = '/claw/right_grip.png';
+		backGripImg.src  = '/claw/back_grip.png';
+	});
+};
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
@@ -126,16 +215,17 @@ const initPhysics = () => {
 
 	Composite.add(world, [
 		Bodies.rectangle(W / 2, H + 25, W, 50, wallOpts),
-		Bodies.rectangle(-25,   H / 2,  50, H,  wallOpts),
+		Bodies.rectangle(-25,    H / 2, 50, H,  wallOpts),
 		Bodies.rectangle(W + 25, H / 2, 50, H,  wallOpts),
-		// Chute divider wall
-		Bodies.rectangle(180, H - 150, 15, 400, {
-			isStatic: true,
-			collisionFilter: { category: WALL_CATEGORY },
-			render: { fillStyle: '#2c3e50' },
-		}),
 	]);
 
+	// Size the background canvas
+	if (bgCanvas.value) {
+		bgCanvas.value.width  = W;
+		bgCanvas.value.height = H;
+	}
+
+	rebuildChute();
 	spawnPrizes();
 
 	Events.on(engine, 'afterUpdate', onPhysicsUpdate);
@@ -143,6 +233,24 @@ const initPhysics = () => {
 
 	window.addEventListener('resize', handleResize);
 	window.addEventListener('keydown', handleKeyDown);
+};
+
+// ─── Chute management ─────────────────────────────────────────────────────────
+
+/**
+ * Removes the old chute divider wall (if any) and creates a new one sized to
+ * match the current chuteWidth. Called on init and whenever prizes are re-spawned.
+ */
+const rebuildChute = () => {
+	if (chuteWall) Composite.remove(world, chuteWall);
+	const H = window.innerHeight;
+	const w = chuteWidth.value;
+	chuteWall = Bodies.rectangle(w, H - 150, 15, 400, {
+		isStatic: true,
+		collisionFilter: { category: WALL_CATEGORY },
+		render: { fillStyle: '#2c3e50' },
+	});
+	Composite.add(world, chuteWall);
 };
 
 // ─── Per-frame callbacks ──────────────────────────────────────────────────────
@@ -155,7 +263,6 @@ const onPhysicsUpdate = () => {
 	if (openAnimActive) {
 		const elapsed = performance.now() - openAnimStart;
 		const t       = Math.min(elapsed / OPEN_ANIM_MS, 1.0);
-		// Ease-in-out quad
 		const ease    = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
 		clawOpenAmount = openAnimFrom + (openAnimTo - openAnimFrom) * ease;
 		if (t >= 1.0) {
@@ -173,16 +280,37 @@ const onPhysicsUpdate = () => {
  * Simulates the held prize swinging inside claw-local space using simple
  * Euler integration with spring, gravity, and damping. Overrides the body's
  * real physics position each frame so Matter.js doesn't interfere.
+ *
+ * When a slip is active the spring weakens and the effective floor grows,
+ * allowing the prize to gradually slide out of the claw. At progress=1 the
+ * prize is released back into real physics.
  */
 const tickFakePhysics = () => {
-	const GRAVITY  = 0.30;
-	const DAMPING  = 0.88;
-	const SPRING_K = 0.038;
-	const { cs, housH, armLen, intHalfW, intBot } = getDims();
+	const GRAVITY      = 0.30;
+	const DAMPING      = 0.88;
+	const BASE_SPRING_K = 0.038;
+	const { cs, attachOffset, armLen, intHalfW, intBot } = getDims();
+
+	// Slip: weaken spring and expand the bottom clamp over time
+	let springK     = BASE_SPRING_K;
+	let effectiveBot = intBot;
+
+	if (isSlipping) {
+		const elapsed  = (performance.now() - slipStartTime) / 1000;
+		const progress = Math.min(elapsed / slipDuration, 1.0);
+		// Spring fades to ~5% of normal so gravity takes over
+		springK      = BASE_SPRING_K * (1 - progress * 0.95);
+		effectiveBot = intBot + progress * armLen * 1.5;
+		if (progress >= 1.0) {
+			isSlipping = false;
+			releasePrize();
+			return;
+		}
+	}
 
 	fakeVelY += GRAVITY;
-	fakeVelX -= fakeRelX * SPRING_K;
-	fakeVelY -= fakeRelY * SPRING_K;
+	fakeVelX -= fakeRelX * springK;
+	fakeVelY -= fakeRelY * springK;
 	fakeVelX *= DAMPING;
 	fakeVelY *= DAMPING;
 	fakeRelX += fakeVelX;
@@ -193,10 +321,9 @@ const tickFakePhysics = () => {
 	if (fakeRelX >  halfW)  { fakeRelX =  halfW;  fakeVelX *= -0.45; }
 	if (fakeRelX < -halfW)  { fakeRelX = -halfW;  fakeVelX *= -0.45; }
 	if (fakeRelY < 0)       { fakeRelY = 0;        fakeVelY *= -0.30; }
-	if (fakeRelY > intBot)  { fakeRelY = intBot;   fakeVelY *= -0.50; }
+	if (fakeRelY > effectiveBot) { fakeRelY = effectiveBot; fakeVelY *= -0.50; }
 
-	// Clamp prize to computed world position
-	const holdY = clawY + housH / 2 + armLen * 0.62;
+	const holdY = clawY + attachOffset + armLen * 0.62;
 	Body.setPosition(grabbedPrize, { x: clawX + fakeRelX, y: holdY + fakeRelY });
 	Body.setVelocity(grabbedPrize, { x: 0, y: 0 });
 	Body.setAngularVelocity(grabbedPrize, 0);
@@ -209,10 +336,11 @@ const tickFakePhysics = () => {
  */
 const checkWin = () => {
 	const H = window.innerHeight;
+	const cw = chuteWidth.value;
 	for (let i = prizes.length - 1; i >= 0; i--) {
 		const p = prizes[i];
 		if (p === grabbedPrize) continue;
-		if (p.position.x < 180 && p.position.y > H - 200) {
+		if (p.position.x < cw && p.position.y > H - 200) {
 			Composite.remove(world, p);
 			prizes.splice(i, 1);
 			wonPrizesCount.value++;
@@ -225,193 +353,111 @@ const checkWin = () => {
 // ─── Claw rendering ───────────────────────────────────────────────────────────
 
 /**
- * Draws the full claw assembly (cable, housing, motor, arms) on top of the
- * Matter.js canvas each render frame. Called via Events.on(render, 'afterRender').
+ * Draws the full claw assembly using pre-loaded PNG sprites.
+ *
+ * Layer order (back → front):
+ *   bgCanvas  : back_grip (behind prizes)
+ *   main canvas (afterRender, on top of prizes):
+ *     left_grip  — rotates CCW when closing
+ *     right_grip — rotates CW  when closing
+ *     claw_top   — static housing, drawn last so it sits above the grips
+ *
+ * Called via Events.on(render, 'afterRender').
  */
 const drawClaw = () => {
-	const ctx  = render.context;
-	const cx   = clawX;
-	const cy   = clawY;
-	const dims = getDims();
-	const { housW, housH } = dims;
+	if (!clawTopImg || !leftGripImg || !rightGripImg || !backGripImg) return;
 
-	ctx.save();
+	const ctx   = render.context;
+	const bgCtx = bgCanvas.value?.getContext('2d');
+	if (!bgCtx) return;
+
+	const { clawRenderScale: s } = getDims();
+	const cx = clawX;
+	const cy = clawY;
+
+	// World-space attachment positions relative to claw_top pivot
+	const lgX = cx + (CLAW_TOP_META.lgAttachX - CLAW_TOP_META.pivX) * s;
+	const lgY = cy + (CLAW_TOP_META.lgAttachY - CLAW_TOP_META.pivY) * s;
+	const rgX = cx + (CLAW_TOP_META.rgAttachX - CLAW_TOP_META.pivX) * s;
+	const rgY = cy + (CLAW_TOP_META.rgAttachY - CLAW_TOP_META.pivY) * s;
+	const bgX = cx + (CLAW_TOP_META.bgAttachX - CLAW_TOP_META.pivX) * s;
+	const bgY = cy + (CLAW_TOP_META.bgAttachY - CLAW_TOP_META.pivY) * s;
+
+	// Grip close angle: 0 rad when fully open, CLOSE_ANGLE_DEG when closed
+	const closeAngle = (1 - clawOpenAmount) * CLOSE_ANGLE_DEG * (Math.PI / 180);
 
 	// ── Cable ──
-	const cableGrad = ctx.createLinearGradient(cx - 3, 0, cx + 3, 0);
-	cableGrad.addColorStop(0,    '#333');
-	cableGrad.addColorStop(0.40, '#bbb');
-	cableGrad.addColorStop(1,    '#2a2a2a');
-	ctx.strokeStyle = cableGrad;
-	ctx.lineWidth   = 5;
+	ctx.save();
+	ctx.strokeStyle = '#555';
+	ctx.lineWidth   = Math.max(2, 4 * s);
 	ctx.beginPath();
 	ctx.moveTo(cx, 0);
-	ctx.lineTo(cx, cy - housH / 2);
+	ctx.lineTo(cx, cy - CLAW_TOP_META.pivY * s);
 	ctx.stroke();
-
-	// ── Housing box ──
-	const hx      = cx - housW / 2;
-	const hy      = cy - housH / 2;
-	const boxGrad = ctx.createLinearGradient(hx, hy, hx, hy + housH);
-	boxGrad.addColorStop(0,    '#a0a0a0');
-	boxGrad.addColorStop(0.35, '#e8e8e8');
-	boxGrad.addColorStop(1,    '#505050');
-	ctx.fillStyle   = boxGrad;
-	ctx.strokeStyle = '#1a1a1a';
-	ctx.lineWidth   = 1.5;
-
-	// Rounded rect (manual for broad browser compat)
-	const R = 5;
-	ctx.beginPath();
-	ctx.moveTo(hx + R, hy);
-	ctx.lineTo(hx + housW - R, hy);
-	ctx.quadraticCurveTo(hx + housW, hy, hx + housW, hy + R);
-	ctx.lineTo(hx + housW, hy + housH - R);
-	ctx.quadraticCurveTo(hx + housW, hy + housH, hx + housW - R, hy + housH);
-	ctx.lineTo(hx + R, hy + housH);
-	ctx.quadraticCurveTo(hx, hy + housH, hx, hy + housH - R);
-	ctx.lineTo(hx, hy + R);
-	ctx.quadraticCurveTo(hx, hy, hx + R, hy);
-	ctx.closePath();
-	ctx.fill();
-	ctx.stroke();
-
-	// Rivet detail lines on housing
-	ctx.strokeStyle = 'rgba(0,0,0,0.25)';
-	ctx.lineWidth   = 1;
-	for (let i = 1; i < 4; i++) {
-		const lx = hx + (housW / 4) * i;
-		ctx.beginPath();
-		ctx.moveTo(lx, hy + 4);
-		ctx.lineTo(lx, hy + housH - 4);
-		ctx.stroke();
-	}
-
-	// Motor nub
-	const motorR    = 9 * dims.cs;
-	const motorGrad = ctx.createRadialGradient(cx - 2, cy - 2, 1, cx, cy, motorR);
-	motorGrad.addColorStop(0, '#888');
-	motorGrad.addColorStop(1, '#222');
-	ctx.fillStyle = motorGrad;
-	ctx.beginPath();
-	ctx.arc(cx, cy, motorR, 0, Math.PI * 2);
-	ctx.fill();
-	ctx.fillStyle = '#aaa';
-	ctx.beginPath();
-	ctx.arc(cx, cy, motorR * 0.45, 0, Math.PI * 2);
-	ctx.fill();
-
-	// ── Arms ──
-	drawClawArm(ctx, cx, cy, -1, clawOpenAmount, dims);
-	drawClawArm(ctx, cx, cy,  1, clawOpenAmount, dims);
-
 	ctx.restore();
-};
 
-/**
- * Draws one curved claw arm with a metallic gradient and hooked tip.
- *
- * @param {CanvasRenderingContext2D} ctx
- * @param {number} cx    - claw center x (world)
- * @param {number} cy    - claw center y, housing center (world)
- * @param {number} side  - -1 = left arm, 1 = right arm
- * @param {number} open  - 0 = fully closed, 1 = fully open
- * @param {{ housW: number, housH: number, armLen: number, maxSpread: number }} dims
- */
-const drawClawArm = (ctx, cx, cy, side, open, dims) => {
-	const { housW, housH, armLen, maxSpread } = dims;
-	const s      = side;
-	const spread = open * maxSpread;
-
-	// Pivot sits at bottom corner of housing
-	const pivotX = cx + s * (housW * 0.28);
-	const pivotY = cy + housH / 2;
-
-	// Tip sits below and laterally offset based on spread
-	const tipX = cx + s * (8 + spread);
-	const tipY = pivotY + armLen;
-
-	// ── Outer edge bezier (wide side of arm) ──
-	const oc1x = pivotX + s * (10 + spread * 0.45);
-	const oc1y = pivotY + armLen * 0.38;
-	const oc2x = tipX   + s * 14;
-	const oc2y = tipY   - armLen * 0.18;
-
-	// ── Inner edge bezier (narrow side — gives arm its body) ──
-	const innerPivotX = cx + s * (housW * 0.13);
-	const ic1x = innerPivotX + s * (spread * 0.25);
-	const ic1y = pivotY      + armLen * 0.30;
-	const ic2x = cx + s * (spread * 0.70 + 2);
-	const ic2y = tipY - armLen * 0.12;
-
-	// Metallic diagonal gradient
-	const grad = ctx.createLinearGradient(pivotX, pivotY, tipX + s * 10, tipY);
-	grad.addColorStop(0,    '#c0c0c0');
-	grad.addColorStop(0.28, '#e6e6e6');
-	grad.addColorStop(0.62, '#848484');
-	grad.addColorStop(1,    '#3a3a3a');
-
-	ctx.fillStyle   = grad;
-	ctx.strokeStyle = '#1a1a1a';
-	ctx.lineWidth   = 1.2;
-
-	ctx.beginPath();
-	// Outer edge — pivot → tip
-	ctx.moveTo(pivotX + s * 9, pivotY);
-	ctx.bezierCurveTo(
-		oc1x + s * 8, oc1y,
-		oc2x + s * 5, oc2y,
-		tipX  + s * 7, tipY - 2,
+	// ── back_grip on background canvas (renders behind prizes) ──
+	bgCtx.clearRect(0, 0, bgCtx.canvas.width, bgCtx.canvas.height);
+	bgCtx.save();
+	bgCtx.translate(bgX, bgY);
+	bgCtx.drawImage(
+		backGripImg,
+		-BACK_GRIP_META.pivX * s, -BACK_GRIP_META.pivY * s,
+		BACK_GRIP_META.w * s,      BACK_GRIP_META.h * s,
 	);
-	// Hooked tip curves inward
-	ctx.lineTo(tipX + s * 3, tipY + 16);
-	ctx.quadraticCurveTo(tipX - s * 2, tipY + 22, tipX - s * 10, tipY + 9);
-	// Inner edge — tip → pivot
-	ctx.bezierCurveTo(ic2x, ic2y, ic1x, ic1y, innerPivotX - s * 1, pivotY);
-	ctx.closePath();
-	ctx.fill();
-	ctx.stroke();
+	bgCtx.restore();
 
-	// Specular highlight stripe along outer edge
+	// ── left_grip (CCW rotation) ──
 	ctx.save();
-	ctx.globalAlpha = 0.30;
-	ctx.strokeStyle = '#ffffff';
-	ctx.lineWidth   = 2;
-	ctx.beginPath();
-	ctx.moveTo(pivotX + s * 6, pivotY + 5);
-	ctx.bezierCurveTo(
-		pivotX + s * (5 + spread * 0.35), pivotY + armLen * 0.32,
-		tipX   + s * 9,                   tipY   - armLen * 0.22,
-		tipX   + s * 5,                   tipY   - 6,
+	ctx.translate(lgX, lgY);
+	ctx.rotate(-closeAngle);
+	ctx.drawImage(
+		leftGripImg,
+		-LEFT_GRIP_META.pivX * s, -LEFT_GRIP_META.pivY * s,
+		LEFT_GRIP_META.w * s,      LEFT_GRIP_META.h * s,
 	);
-	ctx.stroke();
+	ctx.restore();
+
+	// ── right_grip (CW rotation) ──
+	ctx.save();
+	ctx.translate(rgX, rgY);
+	ctx.rotate(closeAngle);
+	ctx.drawImage(
+		rightGripImg,
+		-RIGHT_GRIP_META.pivX * s, -RIGHT_GRIP_META.pivY * s,
+		RIGHT_GRIP_META.w * s,      RIGHT_GRIP_META.h * s,
+	);
+	ctx.restore();
+
+	// ── claw_top housing (drawn on top of grips) ──
+	ctx.save();
+	ctx.translate(cx, cy);
+	ctx.drawImage(
+		clawTopImg,
+		-CLAW_TOP_META.pivX * s, -CLAW_TOP_META.pivY * s,
+		CLAW_TOP_META.w * s,      CLAW_TOP_META.h * s,
+	);
 	ctx.restore();
 };
 
 // ─── Sensor & grab ────────────────────────────────────────────────────────────
 
 /**
- * Detects prizes that are inside the claw opening using a hybrid test:
+ * Detects prizes inside the claw opening using a hybrid test:
  *
- *  • Vertical   — uses the prize CENTER, which must be within the opening
- *                 band (between sensorYOff and armLen below the pivot).
- *                 This prevents the sensor from firing while the claw is
- *                 still high above a prize; the claw must descend until it
- *                 is actually around the prize before triggering.
+ *  • Vertical   — uses the prize CENTER. The claw must descend until the
+ *                 prize center is within the opening band (sensorYOff to
+ *                 armLen below the grip attach point).
+ *  • Horizontal — uses the prize BOUNDS so large or off-center prizes are
+ *                 still detected even if their center is displaced.
  *
- *  • Horizontal — uses the prize BOUNDS so that large or slightly off-center
- *                 prizes are still detected even if their center is displaced.
- *                 A prize whose edge is within arm-span counts as "reachable";
- *                 whether the grab succeeds is determined separately by
- *                 clawCanGrab(), which applies a tighter centering test.
- *
- * @returns {Matter.Body|null} The closest qualifying prize, or null.
+ * @returns {Matter.Body|null} Closest qualifying prize, or null.
  */
 const checkSensor = () => {
-	const { housH, armLen, maxSpread, sensorYOff } = getDims();
-	const pivotY     = clawY + housH / 2;
-	const openingTop = pivotY + sensorYOff;   // prize center must have passed this
-	const openingBot = pivotY + armLen + 10;  // prize center must be above arm tips
+	const { attachOffset, armLen, maxSpread, sensorYOff } = getDims();
+	const pivotY     = clawY + attachOffset;
+	const openingTop = pivotY + sensorYOff;
+	const openingBot = pivotY + armLen + 10;
 
 	let closest     = null;
 	let closestDist = Infinity;
@@ -419,11 +465,9 @@ const checkSensor = () => {
 	for (const p of prizes) {
 		if (p === grabbedPrize) continue;
 
-		// Vertical: prize CENTER must be inside the opening band
 		const cy = p.position.y;
 		if (cy < openingTop || cy > openingBot) continue;
 
-		// Horizontal: prize BOUNDS must overlap the arm span
 		const b = p.bounds;
 		if (b.max.x < clawX - maxSpread * 1.1 || b.min.x > clawX + maxSpread * 1.1) continue;
 
@@ -441,37 +485,49 @@ const checkSensor = () => {
 
 /**
  * Returns true when the closed claw arms are realistically on the left and
- * right sides of the prize (prize is between the tips horizontally, and
- * within vertical reach of the arm length).
+ * right sides of the prize.
  *
  * @param {Matter.Body} prize
  * @returns {boolean}
  */
 const clawCanGrab = (prize) => {
-	const { housH, armLen, grabHalfW } = getDims();
+	const { attachOffset, armLen, grabHalfW } = getDims();
 	const px      = prize.position.x;
 	const py      = prize.position.y;
 	const horizOk = Math.abs(px - clawX) < grabHalfW;
-	const vertTop = clawY + housH / 2;
-	const vertBot = clawY + housH / 2 + armLen + 20;
+	const vertTop = clawY + attachOffset;
+	const vertBot = clawY + attachOffset + armLen + 20;
 	return horizOk && py > vertTop && py < vertBot;
 };
 
 /**
- * Moves a prize from the real physics layer into fake-physics grab mode.
- * Its collision is ghosted out so it can't interact with anything while held.
+ * Moves a prize into fake-physics grab mode. Ghosts its collision layer so it
+ * cannot interact with other bodies while held.
+ *
+ * If the slip chance roll succeeds, a slip is begun immediately: the prize
+ * will slowly slide out of the claw over [slipMinTime, slipMaxTime] seconds.
  *
  * @param {Matter.Body} prize
  */
 const grabPrize = (prize) => {
-	const { housH, armLen } = getDims();
+	const { attachOffset, armLen } = getDims();
 	grabbedPrize = prize;
-	const holdY  = clawY + housH / 2 + armLen * 0.62;
-	fakeRelX = prize.position.x - clawX;
-	fakeRelY = prize.position.y - holdY;
-	fakeVelX = 0;
-	fakeVelY = 0;
+	const holdY  = clawY + attachOffset + armLen * 0.62;
+	fakeRelX     = prize.position.x - clawX;
+	fakeRelY     = prize.position.y - holdY;
+	fakeVelX     = 0;
+	fakeVelY     = 0;
+	isSlipping   = false;
 	Body.set(prize, { collisionFilter: { category: 0, mask: 0 } });
+
+	// Roll for slip
+	if (Math.random() * 100 < slipChance.value) {
+		const minT = Math.min(slipMinTime.value, slipMaxTime.value);
+		const maxT = Math.max(slipMinTime.value, slipMaxTime.value);
+		slipDuration  = minT + Math.random() * (maxT - minT);
+		isSlipping    = true;
+		slipStartTime = performance.now();
+	}
 };
 
 /**
@@ -480,6 +536,7 @@ const grabPrize = (prize) => {
  */
 const releasePrize = () => {
 	if (!grabbedPrize) return;
+	isSlipping = false;
 	Body.set(grabbedPrize, {
 		collisionFilter: { category: PRIZE_CATEGORY, mask: WALL_CATEGORY | PRIZE_CATEGORY },
 	});
@@ -545,14 +602,11 @@ const dropClaw = async () => {
 	if (isDropping.value) return;
 	isDropping.value = true;
 
-	// Safety: release anything stuck from a previous run
 	if (grabbedPrize) releasePrize();
 
 	const W      = window.innerWidth;
 	const H      = window.innerHeight;
 	const topY   = 100;
-	// Allow the claw to descend close to the actual floor so bottom-layer prizes
-	// are reachable; the sensor will stop it early if it detects something first.
 	const floorY = H - 110;
 	const destX  = (targetX.value / 100) * (W - 500) + 400;
 
@@ -594,10 +648,9 @@ const dropClaw = async () => {
 
 	// 7. Travel to chute
 	message.value = 'DELIVERING...';
-	await moveClaw(90, topY, 6);
+	await moveClaw(chuteWidth.value / 2, topY, 6);
 
-	// 8. Open and release — always drop into real physics so the prize falls
-	//    visibly. checkWin() will award it once it hits the chute floor.
+	// 8. Open and release
 	message.value = 'RELEASE!';
 	await animateClawTo(1.0);
 
@@ -611,15 +664,21 @@ const dropClaw = async () => {
 // ─── Prize spawning ───────────────────────────────────────────────────────────
 
 /**
- * Removes all existing prizes and spawns a fresh set above the viewport.
+ * Removes all existing prizes, rebuilds the chute wall for the current scale,
+ * and spawns a fresh set above the viewport. Prizes are kept to the right of
+ * the chute so they don't block the win area on spawn.
  */
 const spawnPrizes = async () => {
 	const W = window.innerWidth;
 	prizes.forEach(p => Composite.remove(world, p));
 	prizes = [];
+	rebuildChute();
+	const spawnMin = chuteWidth.value + 50;
+	const spawnMax = W - spawnMin;
 	for (let i = 0; i < 18; i++) {
 		const file = prizeFiles[i % prizeFiles.length];
-		await createPrize(`/prizes/${file}`, Math.random() * (W - 450) + 350, -100 - (i * 120));
+		const x    = spawnMin + Math.random() * Math.max(0, spawnMax - spawnMin);
+		await createPrize(`/prizes/${file}`, x, -100 - (i * 120));
 	}
 };
 
@@ -672,13 +731,20 @@ const createPrize = async (url, x, y) => {
 const handleResize = () => {
 	render.canvas.width  = window.innerWidth;
 	render.canvas.height = window.innerHeight;
+	if (bgCanvas.value) {
+		bgCanvas.value.width  = window.innerWidth;
+		bgCanvas.value.height = window.innerHeight;
+	}
 };
 
 const handleKeyDown = (e) => {
 	if (e.key === '`' || e.key === '~') showSettings.value = !showSettings.value;
 };
 
-onMounted(initPhysics);
+onMounted(async () => {
+	await loadImages();
+	initPhysics();
+});
 
 onUnmounted(() => {
 	window.removeEventListener('resize', handleResize);
@@ -690,6 +756,9 @@ onUnmounted(() => {
 
 <template>
   <div class="game-wrapper">
+    <!-- Background canvas: renders back_grip behind the prizes -->
+    <canvas ref="bgCanvas" class="bg-canvas"></canvas>
+    <!-- Matter.js canvas: prizes + foreground claw sprites -->
     <canvas ref="canvas"></canvas>
 
     <div class="ui-overlay">
@@ -713,14 +782,26 @@ onUnmounted(() => {
     <div v-if="showSettings" class="dev-menu">
       <h2>ENGINEER MODE</h2>
       <div class="field">
-        <label>PRIZE SCALE</label>
-        <input type="range" v-model="prizeScale" min="0.2" max="1.0" step="0.05" />
+        <label>PRIZE SCALE: {{ prizeScale }}</label>
+        <input type="range" v-model.number="prizeScale" min="0.2" max="1.0" step="0.05" />
+      </div>
+      <div class="field">
+        <label>SLIP CHANCE: {{ slipChance }}%</label>
+        <input type="range" v-model.number="slipChance" min="0" max="100" step="5" />
+      </div>
+      <div class="field">
+        <label>SLIP MIN TIME: {{ slipMinTime }}s</label>
+        <input type="range" v-model.number="slipMinTime" min="1" max="10" step="0.5" />
+      </div>
+      <div class="field">
+        <label>SLIP MAX TIME: {{ slipMaxTime }}s</label>
+        <input type="range" v-model.number="slipMaxTime" min="1" max="15" step="0.5" />
       </div>
       <button @click="spawnPrizes" class="btn-cyan">RE-SPAWN ALL</button>
       <p class="small">Press ~ to exit</p>
     </div>
 
-    <div class="shoot">
+    <div class="shoot" :style="{ width: chuteWidth + 'px' }">
       <div class="shoot-text">WIN AREA</div>
     </div>
   </div>
@@ -742,7 +823,16 @@ body, html {
   position: relative;
 }
 
-canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 2; }
+/* Both canvases share base positioning */
+canvas {
+  position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+}
+
+/* bg-canvas sits behind Matter.js prizes */
+.bg-canvas { z-index: 1; pointer-events: none; }
+
+/* Matter.js canvas (main) sits in front of bg-canvas */
+canvas:not(.bg-canvas) { z-index: 2; }
 
 .ui-overlay {
   position: absolute; top: 0; left: 0; width: 100%; height: 100%;
@@ -809,13 +899,14 @@ canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index
   font-family: inherit; font-size: 1.2rem; margin-top: 1rem;
 }
 
-.field { margin: 2rem 0; display: flex; flex-direction: column; gap: 1rem; }
+.field { margin: 1.5rem 0; display: flex; flex-direction: column; gap: 0.75rem; }
 .small { font-size: 0.8rem; opacity: 0.5; margin-top: 2rem; }
 
 .shoot {
-  position: absolute; bottom: 0; left: 0; width: 180px; height: 300px;
+  position: absolute; bottom: 0; left: 0; height: 300px;
   background: rgba(34, 211, 238, 0.05); border-right: 2px solid rgba(34, 211, 238, 0.3);
   z-index: 5; display: flex; align-items: center; justify-content: center;
+  transition: width 0.3s ease;
 }
 
 .shoot-text {
