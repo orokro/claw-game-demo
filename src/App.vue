@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue';
+import { ref, computed, nextTick, onMounted, onUnmounted } from 'vue';
 import Matter from 'matter-js';
 import decomp from 'poly-decomp';
 
@@ -36,34 +36,44 @@ const RIGHT_GRIP_META = { w: 190, h: 357, pivX: 25,  pivY: 25 };
 const BACK_GRIP_META  = { w: 65,  h: 305, pivX: 31,  pivY: 14 };
 
 /** Native grip length in pixels (pivot-to-tip) */
-const GRIP_LENGTH_NATIVE   = 332;   // RIGHT_GRIP_META.h - RIGHT_GRIP_META.pivY
+const GRIP_LENGTH_NATIVE   = 332;
 /** Native distance from claw_top pivot down to grip attach point */
-const GRIP_ATTACH_NATIVE_Y = 212;   // CLAW_TOP_META.lgAttachY - CLAW_TOP_META.pivY
+const GRIP_ATTACH_NATIVE_Y = 212;
 /** Max closing angle for left/right grips (degrees) */
 const CLOSE_ANGLE_DEG = 20;
 /** How far (px) back_grip shifts down when fully closed */
 const BACK_GRIP_CLOSE_OFFSET = 20;
 
 // ─── Vue refs ─────────────────────────────────────────────────────────────────
-const canvas       = ref(null);
-const bgCanvas     = ref(null);
-const targetX      = ref(50);      // internal — set by !drop command
-const isDropping   = ref(false);
-const showSettings = ref(false);
-const prizeScale   = ref(0.9);     // default
-const message      = ref('Ready!');
+const canvas        = ref(null);
+const bgCanvas      = ref(null);
+const bgVideo       = ref(null);
+const cmdInputEl    = ref(null);   // for auto-focus after drop
+const nameInputEl   = ref(null);   // for auto-focus on name modal open
+
+const targetX       = ref(50);     // internal — set by !drop command
+const isDropping    = ref(false);
+const showSettings  = ref(false);
+const prizeScale    = ref(0.9);
+const message       = ref('Ready!');
 const wonPrizesCount = ref(0);
 
 // Slip mechanic
-const slipChance  = ref(50);   // % chance
-const slipMinTime = ref(1.5);  // seconds
-const slipMaxTime = ref(3);    // seconds
+const slipChance  = ref(50);
+const slipMinTime = ref(1.5);
+const slipMaxTime = ref(3);
 
 // UI / dev options
-const cmdInput   = ref('');
-const showHUD    = ref(false);   // title + status visibility
-const pushOnMiss = ref(true);   // nudge pile on a miss
-const pushOnGrab = ref(true);   // nudge pile on a successful grab
+const cmdInput     = ref('');
+const showHUD      = ref(false);
+const pushOnMiss   = ref(true);
+const pushOnGrab   = ref(true);
+const pushStrength = ref(15);
+
+// Player name
+const playerName      = ref('');
+const playerNameInput = ref('');
+const showNameModal   = ref(true);
 
 const prizeFiles = ['bear.png', 'bunny.png', 'cat.png', 'doggo.png', 'pengy.png', 'sheep.png'];
 
@@ -88,10 +98,6 @@ const INTERIOR_BOT_BASE    = 48;
 const OPEN_ANIM_MS         = 420;
 
 // ─── Dynamic chute width ──────────────────────────────────────────────────────
-/**
- * Win-chute width in px, proportional to current prize scale.
- * @type {import('vue').ComputedRef<number>}
- */
 const chuteWidth = computed(() => {
 	const cs = Math.max(0.8, prizeScale.value / 0.45);
 	return Math.round(180 * cs);
@@ -123,14 +129,14 @@ const getDims = () => {
 // ─── Claw runtime state ───────────────────────────────────────────────────────
 let clawX          = 0;
 let clawY          = 0;
-let clawOpenAmount = 1.0;  // 0 = closed, 1 = open
+let clawOpenAmount = 1.0;
 
 let openAnimActive = false;
 let openAnimStart  = 0;
 let openAnimFrom   = 1.0;
 let openAnimTo     = 0.0;
 
-// ─── Fake-physics state for grabbed prize ─────────────────────────────────────
+// ─── Fake-physics state ───────────────────────────────────────────────────────
 let grabbedPrize = null;
 let fakeRelX     = 0;
 let fakeRelY     = 0;
@@ -140,7 +146,7 @@ let fakeVelY     = 0;
 // ─── Slip state ───────────────────────────────────────────────────────────────
 let isSlipping    = false;
 let slipStartTime = 0;
-let slipDuration  = 0;  // seconds
+let slipDuration  = 0;
 
 // ─── Loaded sprite images ─────────────────────────────────────────────────────
 let clawTopImg   = null;
@@ -151,10 +157,36 @@ let backGripImg  = null;
 // ─── Chute physics wall ───────────────────────────────────────────────────────
 let chuteWall = null;
 
+// ─── Canvas drawing helpers ───────────────────────────────────────────────────
+
+/**
+ * Draws a rounded rectangle path onto ctx (no fill/stroke, caller does that).
+ *
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {number} x
+ * @param {number} y
+ * @param {number} w
+ * @param {number} h
+ * @param {number} r - corner radius
+ */
+const roundRectPath = (ctx, x, y, w, h, r) => {
+	ctx.beginPath();
+	ctx.moveTo(x + r, y);
+	ctx.lineTo(x + w - r, y);
+	ctx.arcTo(x + w, y,     x + w, y + r,     r);
+	ctx.lineTo(x + w, y + h - r);
+	ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+	ctx.lineTo(x + r, y + h);
+	ctx.arcTo(x,      y + h, x,      y + h - r, r);
+	ctx.lineTo(x, y + r);
+	ctx.arcTo(x,      y,     x + r,  y,         r);
+	ctx.closePath();
+};
+
 // ─── Image loading ────────────────────────────────────────────────────────────
 
 /**
- * Preloads all four claw sprite images before the game starts.
+ * Preloads all four claw sprite images.
  * @returns {Promise<void>}
  */
 const loadImages = () => {
@@ -182,7 +214,7 @@ const loadImages = () => {
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
 /**
- * Creates the physics engine, renderer, world boundaries, and kicks off the game.
+ * Creates the physics engine, renderer, world boundaries, and starts the game.
  */
 const initPhysics = () => {
 	clawX = window.innerWidth / 2;
@@ -256,10 +288,6 @@ const rebuildChute = () => {
 
 // ─── Per-frame callbacks ──────────────────────────────────────────────────────
 
-/**
- * Runs each physics tick: animates claw open/close, ticks fake physics,
- * and checks the win zone.
- */
 const onPhysicsUpdate = () => {
 	if (openAnimActive) {
 		const elapsed = performance.now() - openAnimStart;
@@ -279,7 +307,7 @@ const onPhysicsUpdate = () => {
 
 /**
  * Simulates the held prize swinging in claw-local space (spring + gravity + damping).
- * During a slip the spring weakens and the floor expands until the prize falls free.
+ * During a slip the spring weakens and floor expands until the prize falls free.
  */
 const tickFakePhysics = () => {
 	const GRAVITY       = 0.30;
@@ -324,9 +352,6 @@ const tickFakePhysics = () => {
 
 // ─── Win detection ────────────────────────────────────────────────────────────
 
-/**
- * Awards a point when any free prize enters the win chute area.
- */
 const checkWin = () => {
 	const H  = window.innerHeight;
 	const cw = chuteWidth.value;
@@ -346,16 +371,15 @@ const checkWin = () => {
 // ─── Claw rendering ───────────────────────────────────────────────────────────
 
 /**
- * Draws the full claw assembly using PNG sprites each render frame.
+ * Draws the full claw assembly using PNG sprites.
  *
  * Layers (back → front):
- *   bgCanvas  — back_grip behind prizes; shifts down by BACK_GRIP_CLOSE_OFFSET as claw closes
- *   main canvas (afterRender, on top of prizes):
- *     left_grip  — rotates CCW when closing
- *     right_grip — rotates CW  when closing
- *     claw_top   — housing drawn last so it sits above the grips
- *
- * Called via Events.on(render, 'afterRender').
+ *   bgCanvas  — back_grip (behind prizes); shifts down as claw closes
+ *   main canvas (afterRender):
+ *     left_grip  (CCW rotation when closing)
+ *     right_grip (CW  rotation when closing)
+ *     claw_top   (housing, on top of grips)
+ *     player name pill (centered in claw_top housing area)
  */
 const drawClaw = () => {
 	if (!clawTopImg || !leftGripImg || !rightGripImg || !backGripImg) return;
@@ -368,7 +392,6 @@ const drawClaw = () => {
 	const cx = clawX;
 	const cy = clawY;
 
-	// World-space attachment positions relative to claw_top pivot
 	const lgX = cx + (CLAW_TOP_META.lgAttachX - CLAW_TOP_META.pivX) * s;
 	const lgY = cy + (CLAW_TOP_META.lgAttachY - CLAW_TOP_META.pivY) * s;
 	const rgX = cx + (CLAW_TOP_META.rgAttachX - CLAW_TOP_META.pivX) * s;
@@ -376,10 +399,7 @@ const drawClaw = () => {
 	const bgX = cx + (CLAW_TOP_META.bgAttachX - CLAW_TOP_META.pivX) * s;
 	const bgY = cy + (CLAW_TOP_META.bgAttachY - CLAW_TOP_META.pivY) * s;
 
-	// 0 rad when fully open → CLOSE_ANGLE_DEG when fully closed
-	const closeAngle = (1 - clawOpenAmount) * CLOSE_ANGLE_DEG * (Math.PI / 180);
-
-	// back_grip slides down as claw closes (open=0 offset, closed=BACK_GRIP_CLOSE_OFFSET)
+	const closeAngle      = (1 - clawOpenAmount) * CLOSE_ANGLE_DEG * (Math.PI / 180);
 	const backGripOffsetY = (1 - clawOpenAmount) * BACK_GRIP_CLOSE_OFFSET;
 
 	// ── Cable ──
@@ -403,7 +423,7 @@ const drawClaw = () => {
 	);
 	bgCtx.restore();
 
-	// ── left_grip (CCW rotation) ──
+	// ── left_grip (CCW) ──
 	ctx.save();
 	ctx.translate(lgX, lgY);
 	ctx.rotate(-closeAngle);
@@ -414,7 +434,7 @@ const drawClaw = () => {
 	);
 	ctx.restore();
 
-	// ── right_grip (CW rotation) ──
+	// ── right_grip (CW) ──
 	ctx.save();
 	ctx.translate(rgX, rgY);
 	ctx.rotate(closeAngle);
@@ -425,7 +445,7 @@ const drawClaw = () => {
 	);
 	ctx.restore();
 
-	// ── claw_top housing (drawn on top of grips) ──
+	// ── claw_top housing (on top of grips) ──
 	ctx.save();
 	ctx.translate(cx, cy);
 	ctx.drawImage(
@@ -434,14 +454,55 @@ const drawClaw = () => {
 		CLAW_TOP_META.w * s,      CLAW_TOP_META.h * s,
 	);
 	ctx.restore();
+
+	// ── Player name pill (on top of claw_top, in the housing area) ──
+	if (playerName.value) {
+		// Vertical center of the claw_top housing body:
+		// image spans cy - pivY*s → cy + (lgAttachY - pivY)*s
+		// center = cy + ((lgAttachY/2) - pivY)*s
+		const labelY  = cy + (CLAW_TOP_META.lgAttachY / 2 - CLAW_TOP_META.pivY) * s;
+		const fontSize = Math.max(11, Math.round(10 + s * 14));
+
+		ctx.save();
+		ctx.font         = `bold ${fontSize}px Rajdhani, sans-serif`;
+		ctx.textAlign    = 'center';
+		ctx.textBaseline = 'middle';
+
+		const textW  = ctx.measureText(playerName.value).width;
+		const padX   = Math.max(6, 8 * s);
+		const padY   = Math.max(3, 4 * s);
+		const pillW  = textW + padX * 2;
+		const pillH  = fontSize + padY * 2;
+		const pillR  = pillH / 2;
+		const pillX  = cx - pillW / 2;
+		const pillY  = labelY - pillH / 2;
+
+		// Pill background
+		ctx.fillStyle = 'rgba(0, 0, 0, 0.60)';
+		roundRectPath(ctx, pillX, pillY, pillW, pillH, pillR);
+		ctx.fill();
+
+		// White text with hard drop shadow
+		ctx.shadowColor   = '#000';
+		ctx.shadowBlur    = 0;
+		ctx.shadowOffsetX = 1.5;
+		ctx.shadowOffsetY = 1.5;
+		ctx.fillStyle     = '#ffffff';
+		ctx.fillText(playerName.value, cx, labelY);
+
+		ctx.shadowColor   = 'transparent';
+		ctx.shadowOffsetX = 0;
+		ctx.shadowOffsetY = 0;
+		ctx.restore();
+	}
 };
 
 // ─── Sensor & grab ────────────────────────────────────────────────────────────
 
 /**
- * Detects prizes inside the claw opening:
- *  • Vertical   — prize CENTER must be within the opening band
- *  • Horizontal — prize BOUNDS must overlap the arm span
+ * Detects prizes inside the claw opening using a hybrid test:
+ *   vertical = prize CENTER within opening band
+ *   horizontal = prize BOUNDS within arm span
  *
  * @returns {Matter.Body|null}
  */
@@ -476,7 +537,7 @@ const checkSensor = () => {
 };
 
 /**
- * Returns true when the closed claw arms are realistically around the prize.
+ * Returns true when the closed arms are realistically around the prize.
  *
  * @param {Matter.Body} prize
  * @returns {boolean}
@@ -492,8 +553,7 @@ const clawCanGrab = (prize) => {
 };
 
 /**
- * Moves a prize into fake-physics grab mode and ghosts its collision.
- * Rolls for a slip and begins it immediately if it triggers.
+ * Moves a prize into fake-physics grab mode and optionally starts a slip.
  *
  * @param {Matter.Body} prize
  */
@@ -518,7 +578,7 @@ const grabPrize = (prize) => {
 };
 
 /**
- * Returns the held prize to the normal physics layer with exit velocity.
+ * Returns the held prize to real physics with exit velocity.
  */
 const releasePrize = () => {
 	if (!grabbedPrize) return;
@@ -531,7 +591,7 @@ const releasePrize = () => {
 };
 
 /**
- * Applies a radial velocity nudge to all free prizes within `radius` px of (cx, cy).
+ * Applies a radial velocity nudge to all free prizes within `radius` px.
  * Simulates the claw disturbing the pile on grabs and misses.
  *
  * @param {number} cx
@@ -605,7 +665,8 @@ const animateClawTo = (toAmount) => {
 
 /**
  * Full drop cycle:
- *   open → position → descend (sensor stop) → close → grab? → push pile → ascend → deliver → release
+ *   open → position → descend → close → grab/push → ascend → deliver → release
+ * Auto-focuses the command input when complete.
  */
 const dropClaw = async () => {
 	if (isDropping.value) return;
@@ -619,14 +680,11 @@ const dropClaw = async () => {
 	const floorY = H - 110;
 	const destX  = (targetX.value / 100) * (W - 500) + 400;
 
-	// 1. Open
 	await animateClawTo(1.0);
 
-	// 2. Lateral positioning
 	message.value = 'LOCKING ON...';
 	await moveClaw(destX, topY, 8);
 
-	// 3. Descend — sensor halts descent early
 	message.value = 'DESCENDING...';
 	let detectedPrize = null;
 
@@ -641,12 +699,11 @@ const dropClaw = async () => {
 		descend();
 	});
 
-	// 4. Close
 	message.value = 'GRAB!';
 	await animateClawTo(0.0);
 	await new Promise(r => setTimeout(r, 130));
 
-	// 5. Grab check + pile disturbance
+	// Grab check + pile disturbance
 	const { cs, attachOffset } = getDims();
 	const pushCx = clawX;
 	const pushCy = clawY + attachOffset;
@@ -654,20 +711,17 @@ const dropClaw = async () => {
 
 	if (detectedPrize && clawCanGrab(detectedPrize)) {
 		grabPrize(detectedPrize);
-		if (pushOnGrab.value) pushNearbyPrizes(pushCx, pushCy, pushR, 5);
+		if (pushOnGrab.value) pushNearbyPrizes(pushCx, pushCy, pushR, pushStrength.value);
 	} else {
-		if (pushOnMiss.value) pushNearbyPrizes(pushCx, pushCy, pushR, 5);
+		if (pushOnMiss.value) pushNearbyPrizes(pushCx, pushCy, pushR, pushStrength.value);
 	}
 
-	// 6. Ascend
 	message.value = 'ASCENDING...';
 	await moveClaw(clawX, topY, 4);
 
-	// 7. Deliver to chute
 	message.value = 'DELIVERING...';
 	await moveClaw(chuteWidth.value / 2, topY, 6);
 
-	// 8. Open and release
 	message.value = 'RELEASE!';
 	await animateClawTo(1.0);
 
@@ -676,6 +730,10 @@ const dropClaw = async () => {
 	await new Promise(r => setTimeout(r, 900));
 	isDropping.value = false;
 	if (message.value !== 'WINNER!') message.value = 'Ready!';
+
+	// Auto-focus command input for the next round
+	await nextTick();
+	cmdInputEl.value?.focus();
 };
 
 // ─── Command parsing ──────────────────────────────────────────────────────────
@@ -688,7 +746,6 @@ const handleCommand = () => {
 	const val = cmdInput.value.trim();
 	if (!val) return;
 
-	// Push to history, dedup consecutive identical entries
 	if (cmdHistory[0] !== val) cmdHistory.unshift(val);
 	if (cmdHistory.length > 50) cmdHistory.pop();
 	historyIndex = -1;
@@ -730,10 +787,40 @@ const handleCmdKeyDown = (e) => {
 	}
 };
 
+// ─── Name modal ───────────────────────────────────────────────────────────────
+
+/**
+ * Confirms the entered player name and closes the modal.
+ * Focuses the command input after the modal is dismissed.
+ */
+const confirmName = async () => {
+	const name = playerNameInput.value.trim();
+	if (!name) return;
+	playerName.value    = name;
+	showNameModal.value = false;
+	await nextTick();
+	cmdInputEl.value?.focus();
+};
+
+// ─── Background video ─────────────────────────────────────────────────────────
+
+/**
+ * On first user interaction, unmute the background video.
+ * Autoplay requires the video start muted; this lifts that restriction.
+ */
+const handleFirstInteraction = () => {
+	if (bgVideo.value) {
+		bgVideo.value.muted  = false;
+		bgVideo.value.volume = 0.3;
+	}
+	document.removeEventListener('click', handleFirstInteraction);
+	document.removeEventListener('keydown', handleFirstInteraction);
+};
+
 // ─── Prize spawning ───────────────────────────────────────────────────────────
 
 /**
- * Removes all prizes, rebuilds the chute for current scale, spawns a fresh set.
+ * Removes all prizes, rebuilds the chute, spawns a fresh set.
  * Spawn range keeps prizes out of the chute area.
  */
 const spawnPrizes = async () => {
@@ -751,7 +838,7 @@ const spawnPrizes = async () => {
 };
 
 /**
- * Loads a prize image, generates a convex-hull physics body, adds to world.
+ * Loads a prize image, builds a convex-hull physics body, adds to world.
  *
  * @param {string} url
  * @param {number} x
@@ -805,8 +892,8 @@ const handleResize = () => {
 };
 
 /**
- * Toggles the dev menu on tilde/backtick press.
- * Skips when an input element is focused to avoid interfering with typing.
+ * Toggles the dev menu on tilde/backtick.
+ * Skips when a text input is focused to avoid interfering with typing.
  *
  * @param {KeyboardEvent} e
  */
@@ -818,13 +905,26 @@ const handleKeyDown = (e) => {
 };
 
 onMounted(async () => {
+	// Register first-interaction handler for video audio
+	document.addEventListener('click',   handleFirstInteraction);
+	document.addEventListener('keydown', handleFirstInteraction);
+
+	// Start the background video (muted for autoplay compliance)
+	bgVideo.value?.play();
+
+	// Auto-focus the name input while images and physics load in parallel
+	await nextTick();
+	nameInputEl.value?.focus();
+
 	await loadImages();
 	initPhysics();
 });
 
 onUnmounted(() => {
-	window.removeEventListener('resize', handleResize);
+	window.removeEventListener('resize',  handleResize);
 	window.removeEventListener('keydown', handleKeyDown);
+	document.removeEventListener('click',   handleFirstInteraction);
+	document.removeEventListener('keydown', handleFirstInteraction);
 	if (runner) Runner.stop(runner);
 	if (render) Render.stop(render);
 });
@@ -832,21 +932,30 @@ onUnmounted(() => {
 
 <template>
   <div class="game-wrapper">
-    <!-- z-index 1: back_grip rendered behind prizes -->
+
+    <!-- ── Layer 0: background video ── -->
+    <video ref="bgVideo" class="bg-video" loop playsinline muted>
+      <source src="/bg/bg.mp4" type="video/mp4" />
+    </video>
+
+    <!-- ── Layer 1: back_grip (behind prizes) ── -->
     <canvas ref="bgCanvas" class="bg-canvas"></canvas>
-    <!-- z-index 2: Matter.js prizes + foreground claw sprites -->
+
+    <!-- ── Layer 2: Matter.js prizes + foreground claw sprites ── -->
     <canvas ref="canvas"></canvas>
 
+    <!-- ── Layer 3: UI overlay ── -->
     <div class="ui-overlay">
-      <!-- Title + status: hidden by default, toggleable via SHOW STATUS HUD in dev menu -->
+      <!-- Title + status: hidden by default, toggled by SHOW STATUS HUD -->
       <div class="header">
         <h1 class="neon-title" v-show="showHUD">CLAW MASTER 3000</h1>
         <div class="msg-box" v-show="showHUD">{{ message }}</div>
       </div>
 
-      <!-- Command input (bottom center) -->
+      <!-- Command input -->
       <div class="control-panel" :class="{ locked: isDropping }">
         <input
+          ref="cmdInputEl"
           type="text"
           class="cmd-input"
           v-model="cmdInput"
@@ -862,7 +971,13 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <!-- Dev menu (press ~ to open) -->
+    <!-- ── Layer 3: Win chute ── -->
+    <div class="shoot" :style="{ width: chuteWidth + 'px' }">
+      <div class="shoot-text">WIN AREA</div>
+      <div class="shoot-wins">PRIZES WON: {{ wonPrizesCount }}</div>
+    </div>
+
+    <!-- ── Layer 4: Dev menu (press ~) ── -->
     <div v-if="showSettings" class="dev-menu">
       <h2>ENGINEER MODE</h2>
       <div class="field">
@@ -881,6 +996,10 @@ onUnmounted(() => {
         <label>SLIP MAX TIME: {{ slipMaxTime }}s</label>
         <input type="range" v-model.number="slipMaxTime" min="0.5" max="15" step="0.5" />
       </div>
+      <div class="field">
+        <label>PUSH FORCE: {{ pushStrength }}</label>
+        <input type="range" v-model.number="pushStrength" min="1" max="100" step="1" />
+      </div>
       <div class="field checkbox-field">
         <label><input type="checkbox" v-model="pushOnMiss" /> PUSH TOYS ON MISSES</label>
         <label><input type="checkbox" v-model="pushOnGrab" /> PUSH TOYS ON GRABS</label>
@@ -890,11 +1009,26 @@ onUnmounted(() => {
       <p class="small">Press ~ to exit</p>
     </div>
 
-    <!-- Win chute: width scales with prize size, counter at bottom -->
-    <div class="shoot" :style="{ width: chuteWidth + 'px' }">
-      <div class="shoot-text">WIN AREA</div>
-      <div class="shoot-wins">PRIZES WON: {{ wonPrizesCount }}</div>
+    <!-- ── Layer 5: Name modal (shown on first load) ── -->
+    <div v-if="showNameModal" class="modal-overlay">
+      <div class="name-modal">
+        <h2 class="modal-title">CLAW MASTER 3000</h2>
+        <p class="modal-sub">Enter your name to play</p>
+        <input
+          ref="nameInputEl"
+          type="text"
+          class="name-input"
+          v-model="playerNameInput"
+          @keydown.enter="confirmName"
+          placeholder="Your name"
+          maxlength="20"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <button class="btn-cyan" @click="confirmName">LET'S GO!</button>
+      </div>
     </div>
+
   </div>
 </template>
 
@@ -910,26 +1044,35 @@ body, html {
 
 .game-wrapper {
   width: 100vw; height: 100vh;
-  background: linear-gradient(180deg, #09090b 0%, #1e1b4b 100%);
   position: relative;
+  background: transparent;
 }
 
-/* Both canvases share base positioning */
+/* ── Background video ── */
+.bg-video {
+  position: absolute; top: 0; left: 0;
+  width: 100%; height: 100%;
+  object-fit: cover;
+  z-index: 0;
+  pointer-events: none;
+}
+
+/* ── Canvas layers ── */
 canvas {
   position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+  pointer-events: none;
 }
-.bg-canvas { z-index: 1; pointer-events: none; }
+.bg-canvas           { z-index: 1; }
 canvas:not(.bg-canvas) { z-index: 2; }
 
+/* ── UI overlay ── */
 .ui-overlay {
   position: absolute; top: 0; left: 0; width: 100%; height: 100%;
   display: flex; flex-direction: column; justify-content: space-between;
-  padding: 3rem; box-sizing: border-box; pointer-events: none; z-index: 10;
+  padding: 3rem; box-sizing: border-box; pointer-events: none; z-index: 3;
 }
 
-.header {
-  display: flex; flex-direction: column; align-items: center;
-}
+.header { display: flex; flex-direction: column; align-items: center; }
 
 .neon-title {
   font-size: 4rem; color: #fff; text-align: center; margin: 0;
@@ -941,20 +1084,21 @@ canvas:not(.bg-canvas) { z-index: 2; }
   font-weight: bold; height: 3rem;
 }
 
-/* Command input panel */
+/* ── Command input panel ── */
 .control-panel {
   pointer-events: auto; align-self: center;
-  background: rgba(15, 23, 42, 0.9); padding: 1.5rem 2.5rem;
+  background: rgba(9, 14, 30, 0.82); padding: 1.5rem 2.5rem;
   border-radius: 24px; border: 2px solid #334155;
   display: flex; flex-direction: column; align-items: center; gap: 0.9rem;
-  box-shadow: 0 20px 50px rgba(0,0,0,0.6), inset 0 0 20px rgba(34, 211, 238, 0.1);
+  box-shadow: 0 20px 50px rgba(0,0,0,0.7), inset 0 0 20px rgba(34, 211, 238, 0.08);
+  backdrop-filter: blur(6px);
 }
 
 .control-panel.locked { opacity: 0.4; pointer-events: none; filter: grayscale(0.5); }
 
 .cmd-input {
   width: 380px; padding: 0.85rem 1.4rem;
-  background: #0f172a; color: #22d3ee;
+  background: #0a1020; color: #22d3ee;
   border: 2px solid #334155; border-radius: 12px;
   font-family: 'Rajdhani', monospace; font-size: 1.7rem; font-weight: bold;
   outline: none; box-sizing: border-box;
@@ -977,44 +1121,11 @@ canvas:not(.bg-canvas) { z-index: 2; }
   padding: 0.1rem 0.4rem; border-radius: 4px;
 }
 
-/* Dev menu */
-.dev-menu {
-  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
-  background: #0f172a; color: #22d3ee; padding: 3rem;
-  border-radius: 24px; z-index: 100; border: 2px solid #db2777;
-  min-width: 430px; pointer-events: auto; text-align: center;
-}
-
-.btn-cyan {
-  width: 100%; padding: 1.2rem; background: #22d3ee; color: #0f172a;
-  border: none; border-radius: 12px; font-weight: bold; cursor: pointer;
-  font-family: inherit; font-size: 1.2rem; margin-top: 1rem;
-}
-
-.field { margin: 1.4rem 0; display: flex; flex-direction: column; gap: 0.7rem; }
-.small { font-size: 0.8rem; opacity: 0.5; margin-top: 2rem; }
-
-.checkbox-field {
-  align-items: flex-start; text-align: left;
-  gap: 0.65rem; padding: 0 0.3rem;
-}
-
-.checkbox-field label {
-  display: flex; align-items: center; gap: 0.75rem;
-  cursor: pointer; font-size: 1.1rem;
-}
-
-.checkbox-field input[type="checkbox"] {
-  width: 18px; height: 18px; cursor: pointer; accent-color: #22d3ee;
-  flex-shrink: 0;
-}
-
-/* Win chute */
+/* ── Win chute ── */
 .shoot {
-  position: absolute; bottom: 0; left: 0; height: 300px;
+  position: absolute; bottom: 0; left: 0; height: 300px; z-index: 3;
   background: rgba(34, 211, 238, 0.05);
   border-right: 2px solid rgba(34, 211, 238, 0.3);
-  z-index: 5;
   display: flex; flex-direction: column;
   align-items: center; justify-content: flex-end;
   padding-bottom: 1.2rem; box-sizing: border-box;
@@ -1035,4 +1146,76 @@ canvas:not(.bg-canvas) { z-index: 2; }
   text-shadow: 0 0 10px rgba(34, 211, 238, 0.6);
   position: relative; z-index: 1;
 }
+
+/* ── Dev menu ── */
+.dev-menu {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  background: rgba(10, 16, 32, 0.96); color: #22d3ee; padding: 3rem;
+  border-radius: 24px; z-index: 20; border: 2px solid #db2777;
+  min-width: 430px; pointer-events: auto; text-align: center;
+  backdrop-filter: blur(8px);
+}
+
+.btn-cyan {
+  width: 100%; padding: 1.2rem; background: #22d3ee; color: #0f172a;
+  border: none; border-radius: 12px; font-weight: bold; cursor: pointer;
+  font-family: inherit; font-size: 1.2rem; margin-top: 1rem;
+  transition: opacity 0.15s;
+}
+
+.btn-cyan:hover { opacity: 0.85; }
+
+.field { margin: 1.4rem 0; display: flex; flex-direction: column; gap: 0.7rem; }
+.small { font-size: 0.8rem; opacity: 0.5; margin-top: 2rem; }
+
+.checkbox-field { align-items: flex-start; text-align: left; gap: 0.65rem; padding: 0 0.3rem; }
+
+.checkbox-field label {
+  display: flex; align-items: center; gap: 0.75rem;
+  cursor: pointer; font-size: 1.1rem;
+}
+
+.checkbox-field input[type="checkbox"] {
+  width: 18px; height: 18px; cursor: pointer; accent-color: #22d3ee; flex-shrink: 0;
+}
+
+/* ── Name modal ── */
+.modal-overlay {
+  position: absolute; inset: 0; z-index: 50;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0, 0, 0, 0.65);
+  backdrop-filter: blur(4px);
+}
+
+.name-modal {
+  background: rgba(10, 16, 32, 0.97); border: 2px solid #22d3ee;
+  border-radius: 28px; padding: 3.5rem 4rem;
+  display: flex; flex-direction: column; align-items: center; gap: 1.4rem;
+  min-width: 400px;
+  box-shadow: 0 0 60px rgba(34, 211, 238, 0.2), 0 30px 60px rgba(0,0,0,0.6);
+}
+
+.modal-title {
+  font-size: 2.4rem; color: #fff; margin: 0;
+  text-shadow: 0 0 10px #22d3ee, 0 0 22px #22d3ee; letter-spacing: 3px;
+}
+
+.modal-sub { color: #94a3b8; font-size: 1.2rem; margin: 0; }
+
+.name-input {
+  width: 100%; padding: 0.85rem 1.4rem;
+  background: #0a1020; color: #fff;
+  border: 2px solid #334155; border-radius: 12px;
+  font-family: 'Rajdhani', sans-serif; font-size: 1.6rem; font-weight: bold;
+  outline: none; box-sizing: border-box;
+  transition: border-color 0.15s, box-shadow 0.15s;
+  text-align: center; caret-color: #22d3ee;
+}
+
+.name-input:focus {
+  border-color: #22d3ee;
+  box-shadow: 0 0 14px rgba(34, 211, 238, 0.35);
+}
+
+.name-input::placeholder { color: #334155; }
 </style>
