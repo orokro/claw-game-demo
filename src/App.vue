@@ -32,32 +32,44 @@ const CLAW_TOP_META = {
 const LEFT_GRIP_META  = { w: 190, h: 357, pivX: 165, pivY: 25 };
 /** right_grip.png: 190×357, pivot at (25,25) — rotates CW when closing */
 const RIGHT_GRIP_META = { w: 190, h: 357, pivX: 25,  pivY: 25 };
-/** back_grip.png: 65×305, pivot at (31,14) — no rotation */
+/** back_grip.png: 65×305, pivot at (31,14) — no rotation, shifts vertically */
 const BACK_GRIP_META  = { w: 65,  h: 305, pivX: 31,  pivY: 14 };
 
 /** Native grip length in pixels (pivot-to-tip) */
-const GRIP_LENGTH_NATIVE = 332;   // RIGHT_GRIP_META.h - RIGHT_GRIP_META.pivY
-/** Native distance from claw_top pivot down to grip attachment point */
-const GRIP_ATTACH_NATIVE_Y = 212; // CLAW_TOP_META.lgAttachY - CLAW_TOP_META.pivY
-/** Maximum closing angle for left/right grips in degrees */
+const GRIP_LENGTH_NATIVE   = 332;   // RIGHT_GRIP_META.h - RIGHT_GRIP_META.pivY
+/** Native distance from claw_top pivot down to grip attach point */
+const GRIP_ATTACH_NATIVE_Y = 212;   // CLAW_TOP_META.lgAttachY - CLAW_TOP_META.pivY
+/** Max closing angle for left/right grips (degrees) */
 const CLOSE_ANGLE_DEG = 20;
+/** How far (px) back_grip shifts down when fully closed */
+const BACK_GRIP_CLOSE_OFFSET = 20;
 
 // ─── Vue refs ─────────────────────────────────────────────────────────────────
-const canvas    = ref(null);
-const bgCanvas  = ref(null);
-const targetX   = ref(50);
-const isDropping = ref(false);
+const canvas       = ref(null);
+const bgCanvas     = ref(null);
+const targetX      = ref(50);      // internal — set by !drop command
+const isDropping   = ref(false);
 const showSettings = ref(false);
-const prizeScale = ref(0.45);
-const message = ref('Ready!');
+const prizeScale   = ref(0.9);     // default
+const message      = ref('Ready!');
 const wonPrizesCount = ref(0);
 
-// Slip mechanic settings
-const slipChance  = ref(60);  // percent chance a grabbed prize will slip
-const slipMinTime = ref(3);   // seconds (minimum slip duration)
-const slipMaxTime = ref(6);   // seconds (maximum slip duration)
+// Slip mechanic
+const slipChance  = ref(50);   // % chance
+const slipMinTime = ref(1.5);  // seconds
+const slipMaxTime = ref(3);    // seconds
+
+// UI / dev options
+const cmdInput   = ref('');
+const showHUD    = ref(false);   // title + status visibility
+const pushOnMiss = ref(true);   // nudge pile on a miss
+const pushOnGrab = ref(true);   // nudge pile on a successful grab
 
 const prizeFiles = ['bear.png', 'bunny.png', 'cat.png', 'doggo.png', 'pengy.png', 'sheep.png'];
+
+// ─── Command history (up/down like a shell) ───────────────────────────────────
+const cmdHistory = [];
+let historyIndex = -1;
 
 // ─── Matter.js globals ────────────────────────────────────────────────────────
 let engine, render, runner, world;
@@ -67,7 +79,7 @@ let prizes = [];
 const PRIZE_CATEGORY = 0x0004;
 const WALL_CATEGORY  = 0x0001;
 
-// ─── Claw base constants (unscaled, at prizeScale = 0.45) ────────────────────
+// ─── Claw base constants (unscaled at prizeScale = 0.45) ─────────────────────
 const ARM_LENGTH_BASE      = 100;
 const MAX_SPREAD_BASE      = 65;
 const SENSOR_Y_OFFSET_BASE = 42;
@@ -75,10 +87,9 @@ const INTERIOR_HALF_W_BASE = 18;
 const INTERIOR_BOT_BASE    = 48;
 const OPEN_ANIM_MS         = 420;
 
-// ─── Dynamic chute width (scales with prize size) ─────────────────────────────
+// ─── Dynamic chute width ──────────────────────────────────────────────────────
 /**
- * Width of the win chute in pixels. Scales proportionally with prizeScale so
- * larger prizes can still fall into it.
+ * Win-chute width in px, proportional to current prize scale.
  * @type {import('vue').ComputedRef<number>}
  */
 const chuteWidth = computed(() => {
@@ -87,22 +98,15 @@ const chuteWidth = computed(() => {
 });
 
 /**
- * Returns all claw dimensions scaled proportionally to the current prize size.
- * At default prizeScale (0.45) every value equals its BASE counterpart.
- *
- * @returns {{
- *   cs: number, armLen: number, maxSpread: number,
- *   sensorYOff: number, grabHalfW: number,
- *   intHalfW: number, intBot: number,
- *   clawRenderScale: number, attachOffset: number
- * }}
+ * Returns all scaled claw dimensions for the current prizeScale.
+ * @returns {{ cs, armLen, maxSpread, sensorYOff, grabHalfW, intHalfW, intBot, clawRenderScale, attachOffset }}
  */
 const getDims = () => {
-	const cs             = Math.max(0.8, prizeScale.value / 0.45);
-	const armLen         = ARM_LENGTH_BASE * cs;
+	const cs              = Math.max(0.8, prizeScale.value / 0.45);
+	const armLen          = ARM_LENGTH_BASE * cs;
 	const clawRenderScale = armLen / GRIP_LENGTH_NATIVE;
-	const attachOffset   = GRIP_ATTACH_NATIVE_Y * clawRenderScale;
-	const maxSpread      = MAX_SPREAD_BASE * cs;
+	const attachOffset    = GRIP_ATTACH_NATIVE_Y * clawRenderScale;
+	const maxSpread       = MAX_SPREAD_BASE * cs;
 	return {
 		cs,
 		armLen,
@@ -119,9 +123,8 @@ const getDims = () => {
 // ─── Claw runtime state ───────────────────────────────────────────────────────
 let clawX          = 0;
 let clawY          = 0;
-let clawOpenAmount = 1.0;  // 0 = fully closed, 1 = fully open
+let clawOpenAmount = 1.0;  // 0 = closed, 1 = open
 
-// Animation state
 let openAnimActive = false;
 let openAnimStart  = 0;
 let openAnimFrom   = 1.0;
@@ -219,7 +222,6 @@ const initPhysics = () => {
 		Bodies.rectangle(W + 25, H / 2, 50, H,  wallOpts),
 	]);
 
-	// Size the background canvas
 	if (bgCanvas.value) {
 		bgCanvas.value.width  = W;
 		bgCanvas.value.height = H;
@@ -238,8 +240,7 @@ const initPhysics = () => {
 // ─── Chute management ─────────────────────────────────────────────────────────
 
 /**
- * Removes the old chute divider wall (if any) and creates a new one sized to
- * match the current chuteWidth. Called on init and whenever prizes are re-spawned.
+ * Removes the old chute divider wall and recreates it at the current chuteWidth.
  */
 const rebuildChute = () => {
 	if (chuteWall) Composite.remove(world, chuteWall);
@@ -256,8 +257,8 @@ const rebuildChute = () => {
 // ─── Per-frame callbacks ──────────────────────────────────────────────────────
 
 /**
- * Runs each physics tick: ticks claw open/close animation,
- * updates fake-physics for held prize, and checks the win zone.
+ * Runs each physics tick: animates claw open/close, ticks fake physics,
+ * and checks the win zone.
  */
 const onPhysicsUpdate = () => {
 	if (openAnimActive) {
@@ -277,28 +278,21 @@ const onPhysicsUpdate = () => {
 };
 
 /**
- * Simulates the held prize swinging inside claw-local space using simple
- * Euler integration with spring, gravity, and damping. Overrides the body's
- * real physics position each frame so Matter.js doesn't interfere.
- *
- * When a slip is active the spring weakens and the effective floor grows,
- * allowing the prize to gradually slide out of the claw. At progress=1 the
- * prize is released back into real physics.
+ * Simulates the held prize swinging in claw-local space (spring + gravity + damping).
+ * During a slip the spring weakens and the floor expands until the prize falls free.
  */
 const tickFakePhysics = () => {
-	const GRAVITY      = 0.30;
-	const DAMPING      = 0.88;
+	const GRAVITY       = 0.30;
+	const DAMPING       = 0.88;
 	const BASE_SPRING_K = 0.038;
 	const { cs, attachOffset, armLen, intHalfW, intBot } = getDims();
 
-	// Slip: weaken spring and expand the bottom clamp over time
-	let springK     = BASE_SPRING_K;
+	let springK      = BASE_SPRING_K;
 	let effectiveBot = intBot;
 
 	if (isSlipping) {
 		const elapsed  = (performance.now() - slipStartTime) / 1000;
 		const progress = Math.min(elapsed / slipDuration, 1.0);
-		// Spring fades to ~5% of normal so gravity takes over
 		springK      = BASE_SPRING_K * (1 - progress * 0.95);
 		effectiveBot = intBot + progress * armLen * 1.5;
 		if (progress >= 1.0) {
@@ -316,7 +310,6 @@ const tickFakePhysics = () => {
 	fakeRelX += fakeVelX;
 	fakeRelY += fakeVelY;
 
-	// Bounce off scaled claw interior walls — wider when open so it feels loose
 	const halfW = intHalfW + clawOpenAmount * 28 * cs;
 	if (fakeRelX >  halfW)  { fakeRelX =  halfW;  fakeVelX *= -0.45; }
 	if (fakeRelX < -halfW)  { fakeRelX = -halfW;  fakeVelX *= -0.45; }
@@ -332,10 +325,10 @@ const tickFakePhysics = () => {
 // ─── Win detection ────────────────────────────────────────────────────────────
 
 /**
- * Checks whether any free prize has entered the win chute area.
+ * Awards a point when any free prize enters the win chute area.
  */
 const checkWin = () => {
-	const H = window.innerHeight;
+	const H  = window.innerHeight;
 	const cw = chuteWidth.value;
 	for (let i = prizes.length - 1; i >= 0; i--) {
 		const p = prizes[i];
@@ -353,14 +346,14 @@ const checkWin = () => {
 // ─── Claw rendering ───────────────────────────────────────────────────────────
 
 /**
- * Draws the full claw assembly using pre-loaded PNG sprites.
+ * Draws the full claw assembly using PNG sprites each render frame.
  *
- * Layer order (back → front):
- *   bgCanvas  : back_grip (behind prizes)
+ * Layers (back → front):
+ *   bgCanvas  — back_grip behind prizes; shifts down by BACK_GRIP_CLOSE_OFFSET as claw closes
  *   main canvas (afterRender, on top of prizes):
  *     left_grip  — rotates CCW when closing
  *     right_grip — rotates CW  when closing
- *     claw_top   — static housing, drawn last so it sits above the grips
+ *     claw_top   — housing drawn last so it sits above the grips
  *
  * Called via Events.on(render, 'afterRender').
  */
@@ -383,8 +376,11 @@ const drawClaw = () => {
 	const bgX = cx + (CLAW_TOP_META.bgAttachX - CLAW_TOP_META.pivX) * s;
 	const bgY = cy + (CLAW_TOP_META.bgAttachY - CLAW_TOP_META.pivY) * s;
 
-	// Grip close angle: 0 rad when fully open, CLOSE_ANGLE_DEG when closed
+	// 0 rad when fully open → CLOSE_ANGLE_DEG when fully closed
 	const closeAngle = (1 - clawOpenAmount) * CLOSE_ANGLE_DEG * (Math.PI / 180);
+
+	// back_grip slides down as claw closes (open=0 offset, closed=BACK_GRIP_CLOSE_OFFSET)
+	const backGripOffsetY = (1 - clawOpenAmount) * BACK_GRIP_CLOSE_OFFSET;
 
 	// ── Cable ──
 	ctx.save();
@@ -396,10 +392,10 @@ const drawClaw = () => {
 	ctx.stroke();
 	ctx.restore();
 
-	// ── back_grip on background canvas (renders behind prizes) ──
+	// ── back_grip on background canvas (behind prizes) ──
 	bgCtx.clearRect(0, 0, bgCtx.canvas.width, bgCtx.canvas.height);
 	bgCtx.save();
-	bgCtx.translate(bgX, bgY);
+	bgCtx.translate(bgX, bgY + backGripOffsetY);
 	bgCtx.drawImage(
 		backGripImg,
 		-BACK_GRIP_META.pivX * s, -BACK_GRIP_META.pivY * s,
@@ -443,15 +439,11 @@ const drawClaw = () => {
 // ─── Sensor & grab ────────────────────────────────────────────────────────────
 
 /**
- * Detects prizes inside the claw opening using a hybrid test:
+ * Detects prizes inside the claw opening:
+ *  • Vertical   — prize CENTER must be within the opening band
+ *  • Horizontal — prize BOUNDS must overlap the arm span
  *
- *  • Vertical   — uses the prize CENTER. The claw must descend until the
- *                 prize center is within the opening band (sensorYOff to
- *                 armLen below the grip attach point).
- *  • Horizontal — uses the prize BOUNDS so large or off-center prizes are
- *                 still detected even if their center is displaced.
- *
- * @returns {Matter.Body|null} Closest qualifying prize, or null.
+ * @returns {Matter.Body|null}
  */
 const checkSensor = () => {
 	const { attachOffset, armLen, maxSpread, sensorYOff } = getDims();
@@ -484,8 +476,7 @@ const checkSensor = () => {
 };
 
 /**
- * Returns true when the closed claw arms are realistically on the left and
- * right sides of the prize.
+ * Returns true when the closed claw arms are realistically around the prize.
  *
  * @param {Matter.Body} prize
  * @returns {boolean}
@@ -501,11 +492,8 @@ const clawCanGrab = (prize) => {
 };
 
 /**
- * Moves a prize into fake-physics grab mode. Ghosts its collision layer so it
- * cannot interact with other bodies while held.
- *
- * If the slip chance roll succeeds, a slip is begun immediately: the prize
- * will slowly slide out of the claw over [slipMinTime, slipMaxTime] seconds.
+ * Moves a prize into fake-physics grab mode and ghosts its collision.
+ * Rolls for a slip and begins it immediately if it triggers.
  *
  * @param {Matter.Body} prize
  */
@@ -520,10 +508,9 @@ const grabPrize = (prize) => {
 	isSlipping   = false;
 	Body.set(prize, { collisionFilter: { category: 0, mask: 0 } });
 
-	// Roll for slip
 	if (Math.random() * 100 < slipChance.value) {
-		const minT = Math.min(slipMinTime.value, slipMaxTime.value);
-		const maxT = Math.max(slipMinTime.value, slipMaxTime.value);
+		const minT    = Math.min(slipMinTime.value, slipMaxTime.value);
+		const maxT    = Math.max(slipMinTime.value, slipMaxTime.value);
 		slipDuration  = minT + Math.random() * (maxT - minT);
 		isSlipping    = true;
 		slipStartTime = performance.now();
@@ -531,8 +518,7 @@ const grabPrize = (prize) => {
 };
 
 /**
- * Returns the held prize to the normal physics layer, restoring collisions
- * and giving it an exit velocity based on its fake-physics momentum.
+ * Returns the held prize to the normal physics layer with exit velocity.
  */
 const releasePrize = () => {
 	if (!grabbedPrize) return;
@@ -544,11 +530,35 @@ const releasePrize = () => {
 	grabbedPrize = null;
 };
 
+/**
+ * Applies a radial velocity nudge to all free prizes within `radius` px of (cx, cy).
+ * Simulates the claw disturbing the pile on grabs and misses.
+ *
+ * @param {number} cx
+ * @param {number} cy
+ * @param {number} radius
+ * @param {number} strength - velocity magnitude applied at dead-center
+ */
+const pushNearbyPrizes = (cx, cy, radius, strength) => {
+	for (const p of prizes) {
+		if (p === grabbedPrize) continue;
+		const dx   = p.position.x - cx;
+		const dy   = p.position.y - cy;
+		const dist = Math.sqrt(dx * dx + dy * dy);
+		if (dist < radius && dist > 0) {
+			const mag = strength * (1 - dist / radius);
+			Body.setVelocity(p, {
+				x: p.velocity.x + (dx / dist) * mag,
+				y: p.velocity.y + (dy / dist) * mag,
+			});
+		}
+	}
+};
+
 // ─── Movement helpers ─────────────────────────────────────────────────────────
 
 /**
  * Smoothly moves the claw to (tx, ty) at the given speed in px/frame.
- * Returns a Promise that resolves when the claw arrives.
  *
  * @param {number} tx
  * @param {number} ty
@@ -576,8 +586,7 @@ const moveClaw = (tx, ty, speed) => {
 };
 
 /**
- * Triggers the open/close animation and returns a Promise that resolves
- * once the animation completes.
+ * Animates the claw open/close to the given amount.
  *
  * @param {number} toAmount - 0 = closed, 1 = open
  * @returns {Promise<void>}
@@ -595,8 +604,8 @@ const animateClawTo = (toAmount) => {
 // ─── Drop sequence ────────────────────────────────────────────────────────────
 
 /**
- * Executes the full claw-machine drop cycle:
- *   open → position → descend (sensor) → close → grab? → ascend → deliver → release
+ * Full drop cycle:
+ *   open → position → descend (sensor stop) → close → grab? → push pile → ascend → deliver → release
  */
 const dropClaw = async () => {
 	if (isDropping.value) return;
@@ -610,14 +619,14 @@ const dropClaw = async () => {
 	const floorY = H - 110;
 	const destX  = (targetX.value / 100) * (W - 500) + 400;
 
-	// 1. Open claw
+	// 1. Open
 	await animateClawTo(1.0);
 
 	// 2. Lateral positioning
 	message.value = 'LOCKING ON...';
 	await moveClaw(destX, topY, 8);
 
-	// 3. Descend — stop the moment the sensor picks up a nearby prize
+	// 3. Descend — sensor halts descent early
 	message.value = 'DESCENDING...';
 	let detectedPrize = null;
 
@@ -632,21 +641,29 @@ const dropClaw = async () => {
 		descend();
 	});
 
-	// 4. Close claw
+	// 4. Close
 	message.value = 'GRAB!';
 	await animateClawTo(0.0);
 	await new Promise(r => setTimeout(r, 130));
 
-	// 5. Check if grab is geometrically valid before committing
+	// 5. Grab check + pile disturbance
+	const { cs, attachOffset } = getDims();
+	const pushCx = clawX;
+	const pushCy = clawY + attachOffset;
+	const pushR  = 130 * cs;
+
 	if (detectedPrize && clawCanGrab(detectedPrize)) {
 		grabPrize(detectedPrize);
+		if (pushOnGrab.value) pushNearbyPrizes(pushCx, pushCy, pushR, 5);
+	} else {
+		if (pushOnMiss.value) pushNearbyPrizes(pushCx, pushCy, pushR, 5);
 	}
 
 	// 6. Ascend
 	message.value = 'ASCENDING...';
 	await moveClaw(clawX, topY, 4);
 
-	// 7. Travel to chute
+	// 7. Deliver to chute
 	message.value = 'DELIVERING...';
 	await moveClaw(chuteWidth.value / 2, topY, 6);
 
@@ -661,12 +678,63 @@ const dropClaw = async () => {
 	if (message.value !== 'WINNER!') message.value = 'Ready!';
 };
 
+// ─── Command parsing ──────────────────────────────────────────────────────────
+
+/**
+ * Parses and executes a chat-style command from the input field.
+ * Recognized format: !drop <0-100>
+ */
+const handleCommand = () => {
+	const val = cmdInput.value.trim();
+	if (!val) return;
+
+	// Push to history, dedup consecutive identical entries
+	if (cmdHistory[0] !== val) cmdHistory.unshift(val);
+	if (cmdHistory.length > 50) cmdHistory.pop();
+	historyIndex = -1;
+
+	const match = val.match(/^!drop\s+(\d+(?:\.\d+)?)$/i);
+	if (match) {
+		targetX.value  = Math.max(0, Math.min(100, parseFloat(match[1])));
+		cmdInput.value = '';
+		dropClaw();
+	} else {
+		cmdInput.value = '';
+	}
+};
+
+/**
+ * Keyboard handler for the command input.
+ * Enter submits; Up/Down cycle history like a shell.
+ *
+ * @param {KeyboardEvent} e
+ */
+const handleCmdKeyDown = (e) => {
+	if (e.key === 'Enter') {
+		handleCommand();
+	} else if (e.key === 'ArrowUp') {
+		e.preventDefault();
+		if (historyIndex < cmdHistory.length - 1) {
+			historyIndex++;
+			cmdInput.value = cmdHistory[historyIndex];
+		}
+	} else if (e.key === 'ArrowDown') {
+		e.preventDefault();
+		if (historyIndex > 0) {
+			historyIndex--;
+			cmdInput.value = cmdHistory[historyIndex];
+		} else if (historyIndex === 0) {
+			historyIndex   = -1;
+			cmdInput.value = '';
+		}
+	}
+};
+
 // ─── Prize spawning ───────────────────────────────────────────────────────────
 
 /**
- * Removes all existing prizes, rebuilds the chute wall for the current scale,
- * and spawns a fresh set above the viewport. Prizes are kept to the right of
- * the chute so they don't block the win area on spawn.
+ * Removes all prizes, rebuilds the chute for current scale, spawns a fresh set.
+ * Spawn range keeps prizes out of the chute area.
  */
 const spawnPrizes = async () => {
 	const W = window.innerWidth;
@@ -683,12 +751,11 @@ const spawnPrizes = async () => {
 };
 
 /**
- * Loads a prize image, generates a convex-hull physics body from its
- * non-transparent pixels, and adds it to the world.
+ * Loads a prize image, generates a convex-hull physics body, adds to world.
  *
- * @param {string} url - public image path
- * @param {number} x   - spawn x
- * @param {number} y   - spawn y (typically above the viewport)
+ * @param {string} url
+ * @param {number} x
+ * @param {number} y
  */
 const createPrize = async (url, x, y) => {
 	const img = new Image();
@@ -737,8 +804,17 @@ const handleResize = () => {
 	}
 };
 
+/**
+ * Toggles the dev menu on tilde/backtick press.
+ * Skips when an input element is focused to avoid interfering with typing.
+ *
+ * @param {KeyboardEvent} e
+ */
 const handleKeyDown = (e) => {
-	if (e.key === '`' || e.key === '~') showSettings.value = !showSettings.value;
+	if (e.key === '`' || e.key === '~') {
+		if (document.activeElement?.tagName === 'INPUT') return;
+		showSettings.value = !showSettings.value;
+	}
 };
 
 onMounted(async () => {
@@ -756,29 +832,37 @@ onUnmounted(() => {
 
 <template>
   <div class="game-wrapper">
-    <!-- Background canvas: renders back_grip behind the prizes -->
+    <!-- z-index 1: back_grip rendered behind prizes -->
     <canvas ref="bgCanvas" class="bg-canvas"></canvas>
-    <!-- Matter.js canvas: prizes + foreground claw sprites -->
+    <!-- z-index 2: Matter.js prizes + foreground claw sprites -->
     <canvas ref="canvas"></canvas>
 
     <div class="ui-overlay">
+      <!-- Title + status: hidden by default, toggleable via SHOW STATUS HUD in dev menu -->
       <div class="header">
-        <h1 class="neon-title">CLAW MASTER 3000</h1>
-        <div class="win-counter">PRIZES WON: {{ wonPrizesCount }}</div>
-        <div class="msg-box">{{ message }}</div>
+        <h1 class="neon-title" v-show="showHUD">CLAW MASTER 3000</h1>
+        <div class="msg-box" v-show="showHUD">{{ message }}</div>
       </div>
 
+      <!-- Command input (bottom center) -->
       <div class="control-panel" :class="{ locked: isDropping }">
-        <div class="slider-container">
-          <div class="coord-label">TARGET POSITION: {{ targetX }}</div>
-          <input type="range" v-model="targetX" min="0" max="100" class="neon-range" />
+        <input
+          type="text"
+          class="cmd-input"
+          v-model="cmdInput"
+          @keydown="handleCmdKeyDown"
+          placeholder="!drop 50"
+          :disabled="isDropping"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <div class="cmd-hint">
+          Type <code>!drop &lt;number&gt;</code> with a number between 0–100 to play!
         </div>
-        <button class="drop-trigger" @click="dropClaw" :disabled="isDropping">
-          <span class="btn-text">DROP</span>
-        </button>
       </div>
     </div>
 
+    <!-- Dev menu (press ~ to open) -->
     <div v-if="showSettings" class="dev-menu">
       <h2>ENGINEER MODE</h2>
       <div class="field">
@@ -791,18 +875,25 @@ onUnmounted(() => {
       </div>
       <div class="field">
         <label>SLIP MIN TIME: {{ slipMinTime }}s</label>
-        <input type="range" v-model.number="slipMinTime" min="1" max="10" step="0.5" />
+        <input type="range" v-model.number="slipMinTime" min="0.5" max="10" step="0.5" />
       </div>
       <div class="field">
         <label>SLIP MAX TIME: {{ slipMaxTime }}s</label>
-        <input type="range" v-model.number="slipMaxTime" min="1" max="15" step="0.5" />
+        <input type="range" v-model.number="slipMaxTime" min="0.5" max="15" step="0.5" />
+      </div>
+      <div class="field checkbox-field">
+        <label><input type="checkbox" v-model="pushOnMiss" /> PUSH TOYS ON MISSES</label>
+        <label><input type="checkbox" v-model="pushOnGrab" /> PUSH TOYS ON GRABS</label>
+        <label><input type="checkbox" v-model="showHUD" /> SHOW STATUS HUD</label>
       </div>
       <button @click="spawnPrizes" class="btn-cyan">RE-SPAWN ALL</button>
       <p class="small">Press ~ to exit</p>
     </div>
 
+    <!-- Win chute: width scales with prize size, counter at bottom -->
     <div class="shoot" :style="{ width: chuteWidth + 'px' }">
       <div class="shoot-text">WIN AREA</div>
+      <div class="shoot-wins">PRIZES WON: {{ wonPrizesCount }}</div>
     </div>
   </div>
 </template>
@@ -827,11 +918,7 @@ body, html {
 canvas {
   position: absolute; top: 0; left: 0; width: 100%; height: 100%;
 }
-
-/* bg-canvas sits behind Matter.js prizes */
 .bg-canvas { z-index: 1; pointer-events: none; }
-
-/* Matter.js canvas (main) sits in front of bg-canvas */
 canvas:not(.bg-canvas) { z-index: 2; }
 
 .ui-overlay {
@@ -840,57 +927,62 @@ canvas:not(.bg-canvas) { z-index: 2; }
   padding: 3rem; box-sizing: border-box; pointer-events: none; z-index: 10;
 }
 
+.header {
+  display: flex; flex-direction: column; align-items: center;
+}
+
 .neon-title {
   font-size: 4rem; color: #fff; text-align: center; margin: 0;
   text-shadow: 0 0 10px #22d3ee, 0 0 20px #22d3ee; letter-spacing: 4px;
 }
 
-.win-counter { color: #f472b6; font-size: 1.5rem; text-align: center; margin-top: 10px; font-weight: bold; }
-.msg-box { color: #5eead4; font-size: 2rem; text-align: center; margin-top: 20px; font-weight: bold; height: 3rem; }
+.msg-box {
+  color: #5eead4; font-size: 2rem; text-align: center; margin-top: 20px;
+  font-weight: bold; height: 3rem;
+}
 
+/* Command input panel */
 .control-panel {
   pointer-events: auto; align-self: center;
-  background: rgba(15, 23, 42, 0.9); padding: 2.5rem;
-  border-radius: 30px; border: 2px solid #334155;
-  display: flex; gap: 4rem; align-items: center;
+  background: rgba(15, 23, 42, 0.9); padding: 1.5rem 2.5rem;
+  border-radius: 24px; border: 2px solid #334155;
+  display: flex; flex-direction: column; align-items: center; gap: 0.9rem;
   box-shadow: 0 20px 50px rgba(0,0,0,0.6), inset 0 0 20px rgba(34, 211, 238, 0.1);
 }
 
 .control-panel.locked { opacity: 0.4; pointer-events: none; filter: grayscale(0.5); }
 
-.neon-range {
-  -webkit-appearance: none; width: 300px; height: 12px;
-  background: #1e293b; border-radius: 6px; outline: none;
+.cmd-input {
+  width: 380px; padding: 0.85rem 1.4rem;
+  background: #0f172a; color: #22d3ee;
+  border: 2px solid #334155; border-radius: 12px;
+  font-family: 'Rajdhani', monospace; font-size: 1.7rem; font-weight: bold;
+  outline: none; box-sizing: border-box;
+  transition: border-color 0.15s, box-shadow 0.15s;
+  caret-color: #22d3ee;
 }
 
-.neon-range::-webkit-slider-thumb {
-  -webkit-appearance: none; width: 34px; height: 34px;
-  background: #22d3ee; border-radius: 50%; cursor: pointer;
-  box-shadow: 0 0 15px #22d3ee; border: 3px solid #fff;
+.cmd-input:focus {
+  border-color: #22d3ee;
+  box-shadow: 0 0 14px rgba(34, 211, 238, 0.35);
 }
 
-.coord-label { color: #94a3b8; margin-bottom: 12px; text-align: center; font-size: 1.1rem; }
+.cmd-input::placeholder { color: #1e3a4a; }
+.cmd-input:disabled { opacity: 0.4; }
 
-.drop-trigger {
-  background: #db2777; border: none; padding: 6px; border-radius: 18px;
-  cursor: pointer; transition: 0.2s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+.cmd-hint { color: #475569; font-size: 1rem; text-align: center; }
+
+.cmd-hint code {
+  color: #22d3ee; background: rgba(34, 211, 238, 0.1);
+  padding: 0.1rem 0.4rem; border-radius: 4px;
 }
 
-.btn-text {
-  display: block; background: #db2777; color: #fff;
-  padding: 1.2rem 4rem; font-size: 2.5rem; font-weight: bold;
-  border-radius: 12px; border: 2px solid rgba(255,255,255,0.2);
-  box-shadow: inset 0 0 20px rgba(255,255,255,0.3);
-}
-
-.drop-trigger:hover { transform: scale(1.08) rotate(2deg); }
-.drop-trigger:active { transform: scale(0.92); }
-
+/* Dev menu */
 .dev-menu {
   position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
   background: #0f172a; color: #22d3ee; padding: 3rem;
   border-radius: 24px; z-index: 100; border: 2px solid #db2777;
-  min-width: 400px; pointer-events: auto; text-align: center;
+  min-width: 430px; pointer-events: auto; text-align: center;
 }
 
 .btn-cyan {
@@ -899,18 +991,48 @@ canvas:not(.bg-canvas) { z-index: 2; }
   font-family: inherit; font-size: 1.2rem; margin-top: 1rem;
 }
 
-.field { margin: 1.5rem 0; display: flex; flex-direction: column; gap: 0.75rem; }
+.field { margin: 1.4rem 0; display: flex; flex-direction: column; gap: 0.7rem; }
 .small { font-size: 0.8rem; opacity: 0.5; margin-top: 2rem; }
 
+.checkbox-field {
+  align-items: flex-start; text-align: left;
+  gap: 0.65rem; padding: 0 0.3rem;
+}
+
+.checkbox-field label {
+  display: flex; align-items: center; gap: 0.75rem;
+  cursor: pointer; font-size: 1.1rem;
+}
+
+.checkbox-field input[type="checkbox"] {
+  width: 18px; height: 18px; cursor: pointer; accent-color: #22d3ee;
+  flex-shrink: 0;
+}
+
+/* Win chute */
 .shoot {
   position: absolute; bottom: 0; left: 0; height: 300px;
-  background: rgba(34, 211, 238, 0.05); border-right: 2px solid rgba(34, 211, 238, 0.3);
-  z-index: 5; display: flex; align-items: center; justify-content: center;
+  background: rgba(34, 211, 238, 0.05);
+  border-right: 2px solid rgba(34, 211, 238, 0.3);
+  z-index: 5;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: flex-end;
+  padding-bottom: 1.2rem; box-sizing: border-box;
   transition: width 0.3s ease;
 }
 
 .shoot-text {
-  color: rgba(34, 211, 238, 0.2); transform: rotate(-90deg);
-  font-weight: bold; font-size: 2rem; letter-spacing: 8px;
+  position: absolute; top: 50%; left: 50%;
+  transform: translate(-50%, -50%) rotate(-90deg);
+  color: rgba(34, 211, 238, 0.15);
+  font-weight: bold; font-size: 1.4rem; letter-spacing: 6px;
+  white-space: nowrap; pointer-events: none;
+}
+
+.shoot-wins {
+  color: #22d3ee; font-size: 1.1rem; font-weight: bold;
+  letter-spacing: 1px;
+  text-shadow: 0 0 10px rgba(34, 211, 238, 0.6);
+  position: relative; z-index: 1;
 }
 </style>
