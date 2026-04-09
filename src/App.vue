@@ -85,7 +85,7 @@ const playerName      = ref('');
 const playerNameInput = ref('');
 const showNameModal   = ref(true);
 
-const PRIZE_FILES_RELI = ['bear.png', 'bunny.png', 'cat.png', 'doggo.png', 'pengy.png', 'sheep.png'];
+const PRIZE_FILES_RELI = ['Naut_Front.png', 'Naut_Right.png', 'Nuat_Left.png', 'UFO.png'];
 const PRIZE_FILES_FUWA = ['hand.png', 'puff.png', 'sheep.png', 'shell.png'];
 const prizeFiles = DEMO_MODE === 'fuwa' ? PRIZE_FILES_FUWA : PRIZE_FILES_RELI;
 
