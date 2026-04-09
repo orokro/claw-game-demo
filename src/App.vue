@@ -68,7 +68,7 @@ const cmdInput     = ref('');
 const showHUD      = ref(false);
 const pushOnMiss   = ref(true);
 const pushOnGrab   = ref(true);
-const pushStrength = ref(15);
+const pushStrength = ref(100);
 
 // Player name
 const playerName      = ref('');
@@ -405,7 +405,7 @@ const drawClaw = () => {
 	// ── Cable ──
 	ctx.save();
 	ctx.strokeStyle = '#555';
-	ctx.lineWidth   = Math.max(2, 4 * s);
+	ctx.lineWidth   = Math.max(6, 12 * s);
 	ctx.beginPath();
 	ctx.moveTo(cx, 0);
 	ctx.lineTo(cx, cy - CLAW_TOP_META.pivY * s);
@@ -587,6 +587,8 @@ const releasePrize = () => {
 		collisionFilter: { category: PRIZE_CATEGORY, mask: WALL_CATEGORY | PRIZE_CATEGORY },
 	});
 	Body.setVelocity(grabbedPrize, { x: fakeVelX * 2.5, y: fakeVelY * 2.5 });
+	// Gentle random tumble as the prize falls — biased toward the direction it was moving
+	Body.setAngularVelocity(grabbedPrize, (Math.random() - 0.5) * 0.2);
 	grabbedPrize = null;
 };
 
