@@ -20,9 +20,11 @@ const {
 Common.setDecomp(decomp);
 
 // ─── Demo mode (query param ?demo=fuwa | reli) ────────────────────────────────
+// BASE_URL is injected by Vite at build time — './' locally, '/repo-name/' on GitHub Pages
+const BASE      = import.meta.env.BASE_URL;
 const DEMO_MODE = new URLSearchParams(window.location.search).get('demo') ?? 'reli';
-const BG_VIDEO  = DEMO_MODE === 'fuwa' ? '/bg/bg_fuwa.mp4' : '/bg/bg.mp4';
-const PRIZE_DIR = DEMO_MODE === 'fuwa' ? '/prizes_fuwa/'   : '/prizes/';
+const BG_VIDEO  = DEMO_MODE === 'fuwa' ? `${BASE}bg/bg_fuwa.mp4` : `${BASE}bg/bg.mp4`;
+const PRIZE_DIR = DEMO_MODE === 'fuwa' ? `${BASE}prizes_fuwa/`   : `${BASE}prizes/`;
 
 // ─── Claw PNG metadata (native pixel dimensions and pivot/attach coords) ───────
 /** claw_top.png: 290×299, pivot at (145,16), grip attach points at y=228 */
@@ -209,10 +211,10 @@ const loadImages = () => {
 		rightGripImg.onload = onLoad;
 		backGripImg.onload  = onLoad;
 
-		clawTopImg.src   = '/claw/claw_top.png';
-		leftGripImg.src  = '/claw/left_grip.png';
-		rightGripImg.src = '/claw/right_grip.png';
-		backGripImg.src  = '/claw/back_grip.png';
+		clawTopImg.src   = `${BASE}claw/claw_top.png`;
+		leftGripImg.src  = `${BASE}claw/left_grip.png`;
+		rightGripImg.src = `${BASE}claw/right_grip.png`;
+		backGripImg.src  = `${BASE}claw/back_grip.png`;
 	});
 };
 
