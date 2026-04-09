@@ -19,6 +19,11 @@ const {
 
 Common.setDecomp(decomp);
 
+// ─── Demo mode (query param ?demo=fuwa | reli) ────────────────────────────────
+const DEMO_MODE = new URLSearchParams(window.location.search).get('demo') ?? 'reli';
+const BG_VIDEO  = DEMO_MODE === 'fuwa' ? '/bg/bg_fuwa.mp4' : '/bg/bg.mp4';
+const PRIZE_DIR = DEMO_MODE === 'fuwa' ? '/prizes_fuwa/'   : '/prizes/';
+
 // ─── Claw PNG metadata (native pixel dimensions and pivot/attach coords) ───────
 /** claw_top.png: 290×299, pivot at (145,16), grip attach points at y=228 */
 const CLAW_TOP_META = {
@@ -835,7 +840,7 @@ const spawnPrizes = async () => {
 	for (let i = 0; i < 18; i++) {
 		const file = prizeFiles[i % prizeFiles.length];
 		const x    = spawnMin + Math.random() * Math.max(0, spawnMax - spawnMin);
-		await createPrize(`/prizes/${file}`, x, -100 - (i * 120));
+		await createPrize(`${PRIZE_DIR}${file}`, x, -100 - (i * 120));
 	}
 };
 
@@ -937,7 +942,7 @@ onUnmounted(() => {
 
     <!-- ── Layer 0: background video ── -->
     <video ref="bgVideo" class="bg-video" loop playsinline muted>
-      <source src="/bg/bg.mp4" type="video/mp4" />
+      <source :src="BG_VIDEO" type="video/mp4" />
     </video>
 
     <!-- ── Layer 1: back_grip (behind prizes) ── -->
