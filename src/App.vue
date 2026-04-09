@@ -1023,6 +1023,15 @@ onUnmounted(() => {
       <p class="small">Press ~ to exit</p>
     </div>
 
+    <!-- ── Mobile block (CSS-only, no JS) ── -->
+    <div class="mobile-block">
+      <div class="mobile-block-inner">
+        <div class="mobile-icon">🕹️</div>
+        <h2 class="mobile-title">Desktop Only</h2>
+        <p class="mobile-msg">This game is designed for desktop browsers. Please open it on a computer for the full experience!</p>
+      </div>
+    </div>
+
     <!-- ── Layer 5: Name modal (shown on first load) ── -->
     <div v-if="showNameModal" class="modal-overlay">
       <div class="name-modal">
@@ -1232,4 +1241,35 @@ canvas:not(.bg-canvas) { z-index: 2; }
 }
 
 .name-input::placeholder { color: #334155; }
+
+/* ── Mobile block ── */
+.mobile-block {
+  display: none;
+  position: fixed; inset: 0; z-index: 999;
+  background: #09090b;
+  align-items: center; justify-content: center;
+  text-align: center; padding: 2rem;
+  font-family: 'Rajdhani', sans-serif;
+}
+
+.mobile-block-inner {
+  display: flex; flex-direction: column; align-items: center; gap: 1.2rem;
+  max-width: 340px;
+}
+
+.mobile-icon { font-size: 4rem; }
+
+.mobile-title {
+  color: #22d3ee; font-size: 2.2rem; margin: 0;
+  text-shadow: 0 0 10px #22d3ee;
+  letter-spacing: 2px;
+}
+
+.mobile-msg {
+  color: #94a3b8; font-size: 1.2rem; line-height: 1.6; margin: 0;
+}
+
+@media (max-width: 768px), (pointer: coarse) {
+  .mobile-block { display: flex; }
+}
 </style>
