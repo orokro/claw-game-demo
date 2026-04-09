@@ -22,7 +22,10 @@ Common.setDecomp(decomp);
 // ─── Demo mode (query param ?demo=fuwa | reli) ────────────────────────────────
 // BASE_URL is injected by Vite at build time — './' locally, '/repo-name/' on GitHub Pages
 const BASE      = import.meta.env.BASE_URL;
-const DEMO_MODE = new URLSearchParams(window.location.search).get('demo') ?? 'reli';
+const _params   = new URLSearchParams(window.location.search);
+const DEMO_MODE = _params.get('demo') ?? 'reli';
+const _scaleRaw = parseFloat(_params.get('scale') ?? '');
+const DEFAULT_SCALE = Number.isFinite(_scaleRaw) ? Math.min(1.0, Math.max(0.2, _scaleRaw)) : 0.9;
 const BG_VIDEO  = DEMO_MODE === 'fuwa' ? `${BASE}bg/bg_fuwa.mp4` : `${BASE}bg/bg.mp4`;
 const PRIZE_DIR = DEMO_MODE === 'fuwa' ? `${BASE}prizes_fuwa/`   : `${BASE}prizes/`;
 
@@ -61,7 +64,7 @@ const nameInputEl   = ref(null);   // for auto-focus on name modal open
 const targetX       = ref(50);     // internal — set by !drop command
 const isDropping    = ref(false);
 const showSettings  = ref(false);
-const prizeScale    = ref(0.9);
+const prizeScale    = ref(DEFAULT_SCALE);
 const message       = ref('Ready!');
 const wonPrizesCount = ref(0);
 
