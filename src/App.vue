@@ -82,7 +82,9 @@ const playerName      = ref('');
 const playerNameInput = ref('');
 const showNameModal   = ref(true);
 
-const prizeFiles = ['bear.png', 'bunny.png', 'cat.png', 'doggo.png', 'pengy.png', 'sheep.png'];
+const PRIZE_FILES_RELI = ['bear.png', 'bunny.png', 'cat.png', 'doggo.png', 'pengy.png', 'sheep.png'];
+const PRIZE_FILES_FUWA = ['hand.png', 'puff.png', 'sheep.png', 'shell.png'];
+const prizeFiles = DEMO_MODE === 'fuwa' ? PRIZE_FILES_FUWA : PRIZE_FILES_RELI;
 
 // ─── Command history (up/down like a shell) ───────────────────────────────────
 const cmdHistory = [];
